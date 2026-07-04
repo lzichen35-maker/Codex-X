@@ -72,6 +72,8 @@ jobs:
           releaseBody: |
             Codex-X desktop release.
 
+            See `CHANGELOG.md` for highlights.
+
             - macOS: `.dmg`
             - Windows: `.msi`
             - Linux: `.deb` / `.rpm`
