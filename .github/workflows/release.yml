@@ -139,4 +139,10 @@ jobs:
           else
             gh release create "$tag" --title "$title" --notes-file release-body.md --latest
           fi
-          gh release upload "$tag" release-assets/* --clobber
+          mapfile -t assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.deb' -o -name '*.rpm' \) -print | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+          printf 'Uploading %s\n' "${assets[@]}"
+          gh release upload "$tag" "${assets[@]}" --clobber

@@ -2,6 +2,12 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [v0.2.10] - 2026-07-04
+
+- 修复 Release 发布任务上传 Linux 产物时误把 `deb/`、`rpm/` 目录当作资产上传的问题。
+- 发布任务现在只收集 `.dmg` / `.msi` / `.deb` / `.rpm` 文件并统一上传。
+- 补齐稳定的三平台 Release 自动发布流程。
+
 ## [v0.2.9] - 2026-07-04
 
 - 修复 GitHub Actions Release 发布流程：不再由三平台矩阵并发创建 Release，改为先上传构建产物，再由单独发布任务统一创建/更新 Release。
