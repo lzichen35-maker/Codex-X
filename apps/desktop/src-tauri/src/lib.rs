@@ -194,6 +194,21 @@ struct AboutInfo {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct SessionPreview {
+    id: String,
+    title: String,
+    model_provider: Option<String>,
+    model: Option<String>,
+    cwd: Option<String>,
+    rollout_path: Option<String>,
+    updated_at_ms: Option<i64>,
+    archived: bool,
+    has_user_event: bool,
+    needs_sync: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SessionSyncStatus {
     codex_dir: String,
     target_provider: String,
@@ -207,6 +222,7 @@ struct SessionSyncStatus {
     needs_sync: bool,
     backup_dir: Option<String>,
     warnings: Vec<String>,
+    sessions: Vec<SessionPreview>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -236,6 +252,14 @@ struct SqliteScan {
     sqlite_threads: usize,
     mismatched_threads: usize,
     warnings: Vec<String>,
+}
+
+fn sql_select_column(cols: &HashSet<String>, name: &str, fallback: &str) -> String {
+    if cols.contains(name) {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    } else {
+        fallback.to_string()
+    }
 }
 
 fn io_err(path: &Path, source: std::io::Error) -> CodexxError {
@@ -1361,6 +1385,123 @@ fn scan_sqlite(codex_dir: &Path, target_provider: &str) -> Result<SqliteScan> {
     Ok(scan)
 }
 
+fn list_session_previews(
+    codex_dir: &Path,
+    target_provider: &str,
+    limit: usize,
+) -> Result<(Vec<SessionPreview>, Vec<String>)> {
+    let mut sessions = Vec::new();
+    let mut warnings = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in sqlite_candidate_paths(codex_dir) {
+        let conn = match Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(conn) => conn,
+            Err(e) => {
+                warnings.push(format!("无法读取会话数据库: {} ({e})", path.display()));
+                continue;
+            }
+        };
+        if !sqlite_has_table(&conn, "threads")? {
+            continue;
+        }
+        let cols = table_column_set(&conn, "threads")?;
+        if !cols.contains("id") {
+            continue;
+        }
+
+        let title_col = sql_select_column(&cols, "title", "NULL");
+        let first_message_col = sql_select_column(&cols, "first_user_message", "NULL");
+        let preview_col = sql_select_column(&cols, "preview", "NULL");
+        let provider_col = sql_select_column(&cols, "model_provider", "NULL");
+        let model_col = sql_select_column(&cols, "model", "NULL");
+        let cwd_col = sql_select_column(&cols, "cwd", "NULL");
+        let rollout_col = sql_select_column(&cols, "rollout_path", "NULL");
+        let updated_ms_col = sql_select_column(&cols, "updated_at_ms", "NULL");
+        let updated_col = sql_select_column(&cols, "updated_at", "NULL");
+        let archived_col = sql_select_column(&cols, "archived", "0");
+        let has_user_event_col = sql_select_column(&cols, "has_user_event", "0");
+        let order_col = if cols.contains("recency_at_ms") {
+            "\"recency_at_ms\""
+        } else if cols.contains("updated_at_ms") {
+            "\"updated_at_ms\""
+        } else if cols.contains("updated_at") {
+            "\"updated_at\""
+        } else {
+            "\"id\""
+        };
+
+        let query = format!(
+            "SELECT \"id\", {title_col}, {first_message_col}, {preview_col}, {provider_col}, {model_col}, {cwd_col}, {rollout_col}, {updated_ms_col}, {updated_col}, {archived_col}, {has_user_event_col} FROM threads ORDER BY {order_col} DESC LIMIT {}",
+            limit.max(1)
+        );
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let title: Option<String> = row.get(1)?;
+                let first_message: Option<String> = row.get(2)?;
+                let preview: Option<String> = row.get(3)?;
+                let model_provider: Option<String> = row.get(4)?;
+                let model: Option<String> = row.get(5)?;
+                let cwd: Option<String> = row.get(6)?;
+                let rollout_path: Option<String> = row.get(7)?;
+                let updated_at_ms: Option<i64> = row.get(8)?;
+                let updated_at: Option<i64> = row.get(9)?;
+                let archived: i64 = row.get(10)?;
+                let has_user_event: i64 = row.get(11)?;
+                let clean_title = [title, first_message, preview]
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.trim().to_string())
+                    .find(|v| !v.is_empty())
+                    .unwrap_or_else(|| format!("会话 {}", id.chars().take(8).collect::<String>()));
+                let normalized_provider = model_provider
+                    .as_ref()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                Ok(SessionPreview {
+                    id,
+                    title: clean_title,
+                    model_provider: normalized_provider.clone(),
+                    model: model.and_then(|v| {
+                        let v = v.trim().to_string();
+                        (!v.is_empty()).then_some(v)
+                    }),
+                    cwd: cwd.and_then(|v| {
+                        let v = v.trim().to_string();
+                        (!v.is_empty()).then_some(v)
+                    }),
+                    rollout_path: rollout_path.and_then(|v| {
+                        let v = v.trim().to_string();
+                        (!v.is_empty()).then_some(v)
+                    }),
+                    updated_at_ms: updated_at_ms.or_else(|| updated_at.map(|v| v * 1000)),
+                    archived: archived != 0,
+                    has_user_event: has_user_event != 0,
+                    needs_sync: normalized_provider.as_deref() != Some(target_provider),
+                })
+            })
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+
+        for row in rows {
+            let session = row.map_err(|e| CodexxError::Database(e.to_string()))?;
+            if seen.insert(session.id.clone()) {
+                sessions.push(session);
+            }
+        }
+    }
+
+    sessions.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    sessions.truncate(limit);
+    Ok((sessions, warnings))
+}
+
 fn provider_sync_backup_root(codex_dir: &Path) -> PathBuf {
     codex_dir.join("backups_state").join("provider-sync")
 }
@@ -1512,8 +1653,11 @@ fn session_sync_status_inner(
     let target = current_model_provider(&codex_dir, target_provider)?;
     let rollouts = scan_rollouts(&codex_dir, &target, false)?;
     let sqlite = scan_sqlite(&codex_dir, &target)?;
+    let session_limit = sqlite.sqlite_threads.max(50).min(1000);
+    let (sessions, session_warnings) = list_session_previews(&codex_dir, &target, session_limit)?;
     let mut warnings = rollouts.warnings;
     warnings.extend(sqlite.warnings);
+    warnings.extend(session_warnings);
     Ok(SessionSyncStatus {
         codex_dir: codex_dir.display().to_string(),
         target_provider: target,
@@ -1527,6 +1671,7 @@ fn session_sync_status_inner(
         needs_sync: rollouts.mismatched_session_meta > 0 || sqlite.mismatched_threads > 0,
         backup_dir: None,
         warnings,
+        sessions,
     })
 }
 

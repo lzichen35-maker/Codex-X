@@ -2,6 +2,12 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [v0.2.12] - 2026-07-04
+
+- Windows MSI 安装器回退为默认简洁样式，移除上一版过重的自定义安装界面图。
+- 【会话管理】页面新增会话列表，展示标题、Provider、模型、工作目录、更新时间、归档/需同步状态。
+- 会话扫描会从 Codex 本地 SQLite threads 表读取最近会话，方便用户直接判断哪些历史 thread 需要同步修复。
+
 ## [v0.2.11] - 2026-07-04
 
 - 调整首次启动自动检查更新体验：不再弹出居中的强提醒窗口。

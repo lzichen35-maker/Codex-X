@@ -145,6 +145,20 @@ type SessionSyncStatus = {
   needsSync: boolean;
   backupDir?: string | null;
   warnings: string[];
+  sessions: SessionPreview[];
+};
+
+type SessionPreview = {
+  id: string;
+  title: string;
+  modelProvider?: string | null;
+  model?: string | null;
+  cwd?: string | null;
+  rolloutPath?: string | null;
+  updatedAtMs?: number | null;
+  archived: boolean;
+  hasUserEvent: boolean;
+  needsSync: boolean;
 };
 
 type SessionSyncResult = {
@@ -671,6 +685,34 @@ function releaseAssetForPlatform(assets: Array<{ name?: string; browser_download
     if (isLinux) return name.endsWith(".appimage") || name.endsWith(".deb") || name.endsWith(".rpm");
     return Boolean(name);
   }) || assets[0];
+}
+
+function formatSessionTime(value?: number | null) {
+  if (!value) return "未知时间";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "未知时间";
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function compactPath(value?: string | null, max = 58) {
+  if (!value) return "未记录路径";
+  const normalized = value.replace(/\\/g, "/");
+  if (normalized.length <= max) return normalized;
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length >= 3) {
+    const tail = parts.slice(-3).join("/");
+    return `…/${tail}`;
+  }
+  return `…${normalized.slice(-max + 1)}`;
+}
+
+function shortId(value: string) {
+  return value.length > 8 ? value.slice(0, 8) : value;
 }
 
 function App() {
@@ -1520,6 +1562,46 @@ function App() {
                 <div className="session-info-list">
                   <div><span>CODEX_HOME</span><code>{sessionStatus?.codexDir || state.codexDir}</code></div>
                   <div><span>{lang === "zh" ? "备份位置" : "Backup"}</span><code>{sessionStatus?.backupDir || `${state.codexDir}/backups_state/provider-sync`}</code></div>
+                </div>
+
+                <div className="session-list-card">
+                  <div className="session-list-head">
+                    <div>
+                      <p className="eyebrow">{lang === "zh" ? "本地会话" : "Local threads"}</p>
+                      <h4>{lang === "zh" ? "会话列表" : "Sessions"}</h4>
+                    </div>
+                    <span>{lang === "zh" ? `展示 ${sessionStatus?.sessions?.length ?? 0} / ${sessionStatus?.sqliteThreads ?? 0} 条` : `${sessionStatus?.sessions?.length ?? 0} / ${sessionStatus?.sqliteThreads ?? 0} shown`}</span>
+                  </div>
+                  {sessionStatus?.sessions?.length ? (
+                    <div className="session-list">
+                      {sessionStatus.sessions.map((item) => (
+                        <article className={cx("session-row", item.needsSync && "needs-sync")} key={item.id}>
+                          <div className="session-row-main">
+                            <div className="session-thread-icon"><History size={18} /></div>
+                            <div className="session-row-text">
+                              <div className="session-row-title">
+                                <strong>{item.title}</strong>
+                                {item.archived && <span className="mini-tag">{lang === "zh" ? "已归档" : "Archived"}</span>}
+                                {item.needsSync && <span className="mini-tag warn">{lang === "zh" ? "需同步" : "Needs sync"}</span>}
+                              </div>
+                              <p title={item.cwd || item.rolloutPath || undefined}>{compactPath(item.cwd || item.rolloutPath)}</p>
+                            </div>
+                          </div>
+                          <div className="session-row-meta">
+                            <span>{formatSessionTime(item.updatedAtMs)}</span>
+                            <code>{item.modelProvider || "unknown"}</code>
+                            <em>{item.model || "model -"}</em>
+                            <small>#{shortId(item.id)}</small>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="session-empty">
+                      <History size={22} />
+                      <span>{lang === "zh" ? "还没有读取到会话。点击右上角“检查会话”刷新。" : "No sessions loaded. Click Check to refresh."}</span>
+                    </div>
+                  )}
                 </div>
 
                 {sessionStatus?.warnings?.length ? (
