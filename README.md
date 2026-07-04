@@ -51,6 +51,7 @@ Codex-X 不是普通的配置文件编辑器，而是一个面向 Codex CLI 的 
 <details>
 <summary><b>提示词注入效果：安全测试场景</b></summary>
 
+<div align="center">
 <table>
   <tr>
     <td align="center" width="50%">
@@ -65,12 +66,14 @@ Codex-X 不是普通的配置文件编辑器，而是一个面向 Codex CLI 的 
     </td>
   </tr>
 </table>
+</div>
 
 </details>
 
 <details>
 <summary><b>提示词注入效果：逆向工程场景</b></summary>
 
+<div align="center">
 <table>
   <tr>
     <td align="center" width="50%">
@@ -92,6 +95,7 @@ Codex-X 不是普通的配置文件编辑器，而是一个面向 Codex CLI 的 
     </td>
   </tr>
 </table>
+</div>
 
 </details>
 
@@ -106,13 +110,40 @@ Codex-X 当前内置两套提示词模板：
 
 你可以在【指令提示词】页面直接点击启用 / 禁用。启用后，Codex-X 会把对应 `.md` 写入 Codex 配置目录，并更新 `config.toml` 中的 `model_instructions_file`。
 
-| 对比项 | `gpt5.4-unrestricted.md` | `gpt5.5-unrestricted.md` |
-| --- | --- | --- |
-| 定位 | 5.4 CTF 沙箱 | 5.5 无限制模式 |
-| 策略 | CTF 竞赛沙箱间接绕过 | 直接声明无限制开发者模式 |
-| 风格 | 安全研究导向，方法论详细 | 极简指令，覆盖面广 |
-| 长度 | 约 180 行 | 约 40 行 |
-| 适用 | GPT-5.4 Codex CLI | GPT-5.5 Codex CLI |
+<div align="center">
+<table>
+  <tr>
+    <th align="center">对比项</th>
+    <th align="center"><code>gpt5.4-unrestricted.md</code></th>
+    <th align="center"><code>gpt5.5-unrestricted.md</code></th>
+  </tr>
+  <tr>
+    <td align="center">定位</td>
+    <td align="center">5.4 CTF 沙箱</td>
+    <td align="center">5.5 无限制模式</td>
+  </tr>
+  <tr>
+    <td align="center">策略</td>
+    <td align="center">CTF 竞赛沙箱间接绕过</td>
+    <td align="center">直接声明无限制开发者模式</td>
+  </tr>
+  <tr>
+    <td align="center">风格</td>
+    <td align="center">安全研究导向，方法论详细</td>
+    <td align="center">极简指令，覆盖面广</td>
+  </tr>
+  <tr>
+    <td align="center">长度</td>
+    <td align="center">约 180 行</td>
+    <td align="center">约 40 行</td>
+  </tr>
+  <tr>
+    <td align="center">适用</td>
+    <td align="center">GPT-5.4 Codex CLI</td>
+    <td align="center">GPT-5.5 Codex CLI</td>
+  </tr>
+</table>
+</div>
 
 部署后可以测试：
 
@@ -234,6 +265,6 @@ pnpm --dir apps/desktop tauri build
 xattr -dr com.apple.quarantine /Applications/Codex-X.app
 ```
 
-## License
+## 许可证
 
-MIT © yynxxxxx
+本项目基于 [MIT License](https://github.com/yynxxxxx/Codex-X/blob/main/LICENSE) 开源。
