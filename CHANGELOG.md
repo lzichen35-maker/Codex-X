@@ -2,6 +2,13 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [v0.2.15] - 2026-07-04
+
+- 会话管理页移除 CODEX_HOME 与 Provider Sync 备份位置展示，页面信息更简洁。
+- 优化 Windows 打开下载页体验：后端改为后台线程 spawn 浏览器，不再等待 `cmd /C start`，避免 WebView 卡顿 2-3 秒。
+- 统一所有外部链接按钮走异步打开逻辑，打开项目主页、反馈页、下载页都不会阻塞界面。
+- 修复 macOS 顶部 toast 被 Overlay 标题栏遮挡的问题，toast 自动下移到标题栏安全区下方。
+
 ## [v0.2.14] - 2026-07-04
 
 - 修复 macOS Overlay 标题栏遮挡内容的问题，为红黄绿窗口按钮预留完整安全区。

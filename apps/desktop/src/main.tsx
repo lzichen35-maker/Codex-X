@@ -1040,6 +1040,15 @@ function App() {
   const restoreBackup = (backupId: string) =>
     call(() => invoke<ActionResult>("restore_backup", { configDir: configDir || null, backupId }), handleActionResult);
 
+  const openExternalUrl = React.useCallback((url?: string | null) => {
+    if (!url) return;
+    window.setTimeout(() => {
+      void invoke("open_url", { url }).catch(() => {
+        setToast(lang === "zh" ? "打开浏览器失败" : "Failed to open browser");
+      });
+    }, 0);
+  }, [lang]);
+
   const checkForUpdates = React.useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
     const repo = aboutInfo?.githubRepo || FALLBACK_GITHUB_REPO;
     const appVersion = aboutInfo?.appVersion || "0.0.0";
@@ -1289,7 +1298,7 @@ function App() {
               <div className="update-actions">
                 <button className="primary-btn" onClick={() => {
                   setUpdatePromptOpen(false);
-                  if (releaseInfo.htmlUrl) void invoke("open_url", { url: releaseInfo.htmlUrl });
+                  openExternalUrl(releaseInfo.htmlUrl);
                 }}>
                   <Download size={16} /> {lang === "zh" ? "现在下载" : "Download now"}
                 </button>
@@ -1317,7 +1326,7 @@ function App() {
                       <strong>{lang === "zh" ? "发现新版本" : "New version found"}</strong>
                       <p>{lang === "zh" ? `Codex-X ${releaseInfo.latestVersion || ""} 已发布` : `Codex-X ${releaseInfo.latestVersion || ""} is available`}</p>
                     </div>
-                    <button className="secondary-btn small" onClick={() => releaseInfo.htmlUrl && void invoke("open_url", { url: releaseInfo.htmlUrl })}>
+                    <button className="secondary-btn small" onClick={() => openExternalUrl(releaseInfo.htmlUrl)}>
                       {lang === "zh" ? "查看更新" : "View"}
                     </button>
                   </div>
@@ -1561,10 +1570,6 @@ function App() {
                   <StatCard icon={<Code2 size={20} />} label={lang === "zh" ? "SQLite 数据库" : "SQLite DBs"} value={sessionStatus?.sqliteDbs ?? "-"} ok />
                 </div>
 
-                <div className="session-info-list">
-                  <div><span>CODEX_HOME</span><code>{sessionStatus?.codexDir || state.codexDir}</code></div>
-                  <div><span>{lang === "zh" ? "备份位置" : "Backup"}</span><code>{sessionStatus?.backupDir || `${state.codexDir}/backups_state/provider-sync`}</code></div>
-                </div>
 
                 <div className="session-list-card">
                   <div className="session-list-head">
@@ -1742,8 +1747,8 @@ function App() {
                     <div><span>{lang === "zh" ? "项目地址" : "Project"}</span><code>{aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}</code></div>
                   </div>
                   <div className="about-actions">
-                    <button className="secondary-btn" onClick={() => void invoke("open_url", { url: aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}` })}><ExternalLink size={16} /> {lang === "zh" ? "打开项目主页" : "Open project"}</button>
-                    <button className="ghost-btn" onClick={() => void invoke("open_url", { url: `${aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}/issues` })}><ExternalLink size={16} /> {lang === "zh" ? "反馈问题" : "Issues"}</button>
+                    <button className="secondary-btn" onClick={() => openExternalUrl(aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`)}><ExternalLink size={16} /> {lang === "zh" ? "打开项目主页" : "Open project"}</button>
+                    <button className="ghost-btn" onClick={() => openExternalUrl(`${aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}/issues`)}><ExternalLink size={16} /> {lang === "zh" ? "反馈问题" : "Issues"}</button>
                   </div>
                 </section>
 
@@ -1758,7 +1763,7 @@ function App() {
                   </div>
                   <div className="about-actions">
                     <button className="primary-btn" onClick={() => void checkForUpdates()} disabled={releaseInfo.status === "checking"}><RefreshCw size={16} className={cx(releaseInfo.status === "checking" && "spin")} /> {lang === "zh" ? "检查更新" : "Check updates"}</button>
-                    <button className="secondary-btn" onClick={() => releaseInfo.htmlUrl && void invoke("open_url", { url: releaseInfo.htmlUrl })} disabled={!releaseInfo.htmlUrl}><Download size={16} /> {lang === "zh" ? "打开下载页" : "Open releases"}</button>
+                    <button className="secondary-btn" onClick={() => openExternalUrl(releaseInfo.htmlUrl)} disabled={!releaseInfo.htmlUrl}><Download size={16} /> {lang === "zh" ? "打开下载页" : "Open releases"}</button>
                   </div>
                 </section>
               </section>

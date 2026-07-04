@@ -201,6 +201,7 @@ input, select, textarea {
 }
 .toast.ok { color: #dbfff3; background: rgba(12, 112, 81, .88); border: 1px solid rgba(31,242,178,.3); }
 .toast.error { color: #fff; background: rgba(157, 38, 63, .92); border: 1px solid rgba(255,120,145,.35); animation: none; }
+.app-shell.mac-shell .toast { top: calc(24px + var(--mac-titlebar-safe)); }
 @keyframes toast { 0% { opacity: 0; transform: translateY(-8px); } 12%, 84% { opacity: 1; transform: translateY(0); } 100% { opacity: 0; transform: translateY(-8px); } }
 
 .update-mask {

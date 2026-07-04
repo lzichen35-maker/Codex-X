@@ -2288,26 +2288,37 @@ fn restore_backup(config_dir: Option<String>, backup_id: String) -> Result<Actio
 
 #[tauri::command]
 fn open_url(url: String) -> std::result::Result<(), String> {
-    let trimmed = url.trim();
+    let trimmed = url.trim().to_string();
     if trimmed.is_empty() {
         return Err("URL 为空".to_string());
     }
 
-    let status = if cfg!(target_os = "macos") {
-        Command::new("open").arg(trimmed).status()
-    } else if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", "start", "", trimmed])
-            .status()
-    } else {
-        Command::new("xdg-open").arg(trimmed).status()
-    };
+    // Do not wait for the browser process. On Windows, waiting for `cmd /C start` can
+    // visibly freeze the WebView for a few seconds before the default browser appears.
+    std::thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("open").arg(&trimmed).spawn();
+        }
 
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("打开失败，退出码: {:?}", s.code())),
-        Err(e) => Err(format!("打开失败: {e}")),
-    }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let _ = Command::new("cmd")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["/C", "start", ""])
+                .arg(&trimmed)
+                .spawn();
+        }
+
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        {
+            let _ = Command::new("xdg-open").arg(&trimmed).spawn();
+        }
+    });
+
+    Ok(())
 }
 
 pub fn run() {
