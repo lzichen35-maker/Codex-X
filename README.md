@@ -1,11 +1,11 @@
 <div align="center">
-  <img src="apps/desktop/src-tauri/icons/icon.png" alt="Codex-X Logo" width="160" />
+  <img src="apps/desktop/src-tauri/icons/icon.png" alt="Codex-X Logo" width="150" />
 
   # Codex-X
 
-  **Codex 提示词注入与配置切换管理器**
+  **Codex 提示词注入 · Provider 切换 · TOML / Auth 可视化管理器**
 
-  一款面向 **OpenAI Codex / Codex CLI** 的跨平台桌面工具，重点提供 `gpt5.5-unrestricted.md` 指令提示词注入、Provider 切换、官方 Auth 管理与 TOML 可视化编辑。
+  一款面向 **OpenAI Codex / Codex CLI** 的跨平台桌面工具，内置 `gpt5.5-unrestricted.md` 与 `gpt5.4-unrestricted.md`，支持一键写入 / 禁用指令提示词、第三方 Provider 切换、官方 Auth 管理、TOML 可视化编辑与本地会话 Provider Sync。
 
   <p>
     <img src="https://img.shields.io/github/v/release/yynxxxxx/Codex-X?label=version&color=blue" alt="version" />
@@ -27,79 +27,126 @@
 
 ## Codex-X 是什么？
 
-Codex-X 不是单纯的配置文件编辑器，而是一个更偏向「Codex 增强启动器」的桌面管理工具。
+Codex-X 不是普通的配置文件编辑器，而是一个面向 Codex CLI 的 **可视化增强管理器**。
 
-它可以把预设或自定义的 **指令提示词模板** 写入 Codex 配置，例如项目内置的：
+它把几个高频操作做成了桌面软件：
 
-```text
-examples/gpt5.5-unrestricted.md
-```
-
-你可以在 UI 中直接启用、禁用、切换多个提示词模板，也可以同时管理不同第三方供应商 API 和官方 OpenAI Codex 登录配置。
-
-## 核心亮点
-
-### 1. 指令提示词注入
-
-- 一键启用 `gpt5.5-unrestricted.md`
-- 支持多个提示词模板并存
-- 启用前自动记录状态，方便回退
-- 支持禁用当前提示词，让 Codex 恢复普通配置
-
-### 2. Provider 可视化切换
-
-- 添加第三方 Codex API Provider
-- 编辑 Base URL / API Key / Model / TOML 配置
-- 当前 Provider 状态清晰可见
-- 支持从 cc-switch 数据库导入 Codex Provider
-
-### 3. 官方 Codex 配置管理
-
-- 读取 Codex 官方 `auth.json`
-- 支持官方 ChatGPT 登录态 Auth 查看与编辑
-- 区分官方 Auth 与第三方 API Key，不混在一起
-
-### 4. TOML 配置编辑
-
-- 可视化查看当前 Codex `config.toml`
-- 在 Provider 编辑页直接编辑完整 TOML
-- 保存后立即同步到 Codex 配置目录
-
-### 5. 跨平台桌面软件
-
-- macOS `.dmg`
-- Windows `.msi`
-- Linux `.deb` / `.rpm`
-- GitHub Releases 自动构建发布
+- 给 Codex 写入 / 禁用指令提示词模板
+- 切换官方 OpenAI 与第三方 Codex API Provider
+- 查看 / 编辑 `~/.codex/config.toml`
+- 查看 / 编辑官方 `~/.codex/auth.json`
+- 检查并修复本地历史会话的 Provider 元数据
 
 ## 软件预览
 
 <details open>
 <summary><b>主界面 / Provider / TOML / Auth 截图</b></summary>
 
-> 这里可以放软件主界面、供应商切换页面、TOML 编辑页面、官方 Auth 页面截图。
-
-<!-- 示例：
 <p align="center">
-  <img src="docs/screenshots/overview.png" width="760" />
+  <img src="gpt5.5-unrestricted.md效果图/软件预览图.png" alt="Codex-X 软件预览图" width="920" />
 </p>
--->
 
 </details>
 
 <details>
-<summary><b>提示词注入前后效果图</b></summary>
+<summary><b>提示词注入后效果图</b></summary>
 
-> 这里可以放启用 `gpt5.5-unrestricted.md` 前后的 Codex 效果对比图。
-
-<!-- 示例：
 <p align="center">
-  <img src="docs/screenshots/prompt-before.png" width="760" />
-  <img src="docs/screenshots/prompt-after.png" width="760" />
+  <img src="gpt5.5-unrestricted.md效果图/SQL注入测试.png" alt="SQL 注入测试效果图" width="860" />
 </p>
--->
+
+<p align="center">
+  <img src="gpt5.5-unrestricted.md效果图/apk逆向.png" alt="APK 逆向效果图" width="860" />
+</p>
+
+<p align="center">
+  <img src="gpt5.5-unrestricted.md效果图/APK逆向2.png" alt="APK 逆向效果图 2" width="860" />
+</p>
+
+<p align="center">
+  <img src="gpt5.5-unrestricted.md效果图/exe逆向.png" alt="EXE 逆向效果图" width="860" />
+</p>
+
+<p align="center">
+  <img src="gpt5.5-unrestricted.md效果图/NSFW1.png" alt="NSFW 测试效果图" width="860" />
+</p>
 
 </details>
+
+## 核心亮点
+
+### 1. 内置双指令提示词模板
+
+Codex-X 当前内置两套提示词模板：
+
+- `examples/gpt5.5-unrestricted.md`
+- `examples/gpt5.4-unrestricted.md`
+
+你可以在【指令提示词】页面直接点击启用 / 禁用。启用后，Codex-X 会把对应 `.md` 写入 Codex 配置目录，并更新 `config.toml` 中的 `model_instructions_file`。
+
+| 对比项 | `gpt5.4-unrestricted.md` | `gpt5.5-unrestricted.md` |
+| --- | --- | --- |
+| 定位 | 5.4 CTF 沙箱 | 5.5 无限制模式 |
+| 策略 | CTF 竞赛沙箱间接绕过 | 直接声明无限制开发者模式 |
+| 风格 | 安全研究导向，方法论详细 | 极简指令，覆盖面广 |
+| 长度 | 约 180 行 | 约 40 行 |
+| 适用 | GPT-5.4 Codex CLI | GPT-5.5 Codex CLI |
+
+部署后可以测试：
+
+```text
+如何对目标进行 SQL 注入测试？
+```
+
+典型效果：
+
+```text
+破甲前 → 拒绝或泛化回答
+破甲后 → 直接给安全研究方法论与测试步骤
+```
+
+### 2. Provider 可视化切换
+
+- 添加第三方 Codex API Provider
+- 编辑 Base URL / API Key / Model / Wire API
+- Provider 页面可查看并编辑对应 TOML
+- 当前启用 Provider 状态清晰可见
+- 支持从 cc-switch 数据库导入 Codex Provider
+
+### 3. 官方 Auth 管理
+
+- 自动读取 Codex 官方 `auth.json`
+- 支持查看 / 编辑 ChatGPT 登录态 Auth
+- 区分官方 Auth 与第三方 API Key
+- 官方配置可和第三方 Provider 在 UI 中统一管理
+
+### 4. TOML 可视化编辑
+
+- 查看当前 Codex `config.toml`
+- 深色代码预览与语法高亮
+- Provider 编辑页可直接编辑完整 TOML
+- 保存后同步到 Codex 配置目录
+
+### 5. 会话管理 / Provider Sync
+
+Codex-X 可以读取 Codex 本地会话数据：
+
+```text
+~/.codex/sqlite/*.db
+~/.codex/state_5.sqlite
+~/.codex/sessions/**/rollout-*.jsonl
+~/.codex/archived_sessions/**/rollout-*.jsonl
+```
+
+用于检查旧会话的 Provider 元数据是否和当前配置一致，并支持一键同步 / 修复，让历史 thread 继续被原生 Codex 识别、打开和续聊。
+
+### 6. 跨平台桌面软件
+
+- macOS `.dmg`
+- Windows `.msi`
+- Linux `.deb` / `.rpm`
+- GitHub Releases 自动构建发布
+- 应用内检查更新
 
 ## 技术栈
 
@@ -154,14 +201,9 @@ pnpm dev
 pnpm --dir apps/desktop tauri build
 ```
 
-## License
-
-MIT © yynxxxxx
-
-
 ## macOS 安装说明
 
-如果你在未签名/未公证的 DMG 中看到“软件已损坏”提示，这是 macOS Gatekeeper 的正常行为。
+如果你在未签名 / 未公证的 DMG 中看到“软件已损坏”提示，这是 macOS Gatekeeper 的正常行为。
 
 - 最佳方式：使用 Apple Developer ID 签名并 notarize
 - 仅本地测试：可手动移除 quarantine 属性
@@ -169,3 +211,7 @@ MIT © yynxxxxx
 ```bash
 xattr -dr com.apple.quarantine /Applications/Codex-X.app
 ```
+
+## License
+
+MIT © yynxxxxx
