@@ -1019,6 +1019,9 @@ function App() {
       const latestVersion = release.tag_name || release.name || "";
       const asset = releaseAssetForPlatform(release.assets || []);
       const hasUpdate = compareVersions(latestVersion, appVersion) > 0;
+      const message = hasUpdate
+        ? (lang === "zh" ? "发现新版本" : "Update available")
+        : (lang === "zh" ? "当前已是最新版本" : "You are up to date");
       setReleaseInfo({
         status: "ok",
         latestVersion,
@@ -1026,16 +1029,24 @@ function App() {
         assetName: asset?.name,
         body: release.body || "",
         hasUpdate,
-        message: hasUpdate
-          ? (lang === "zh" ? "发现新版本" : "Update available")
-          : (lang === "zh" ? "当前已是最新版本" : "You are up to date"),
+        message,
       });
-      if (hasUpdate) setUpdatePromptOpen(true);
+      if (hasUpdate) {
+        if (quiet) {
+          setToast(lang === "zh" ? `发现新版本 ${latestVersion}，可在概览页查看` : `New version ${latestVersion} is available`);
+        } else {
+          setUpdatePromptOpen(true);
+        }
+      } else if (!quiet) {
+        setToast(message);
+      }
     } catch (e) {
+      const message = quiet ? (lang === "zh" ? "自动检查失败" : "Auto check failed") : (lang === "zh" ? "检查失败" : "Check failed");
       setReleaseInfo({
         status: "error",
-        message: quiet ? (lang === "zh" ? "自动检查失败" : "Auto check failed") : (lang === "zh" ? "检查失败" : "Check failed"),
+        message,
       });
+      if (!quiet) setToast(message);
     }
   }, [aboutInfo?.githubRepo, aboutInfo?.appVersion, lang]);
 
