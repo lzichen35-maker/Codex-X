@@ -1,7 +1,8 @@
 use chrono::Local;
-use serde::{Deserialize, Serialize};
 use rusqlite::{params, Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -191,6 +192,52 @@ struct AboutInfo {
     github_repo: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSyncStatus {
+    codex_dir: String,
+    target_provider: String,
+    rollout_files: usize,
+    session_meta_count: usize,
+    mismatched_rollouts: usize,
+    mismatched_session_meta: usize,
+    sqlite_dbs: usize,
+    sqlite_threads: usize,
+    mismatched_threads: usize,
+    needs_sync: bool,
+    backup_dir: Option<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSyncResult {
+    status: SessionSyncStatus,
+    updated_rollouts: usize,
+    updated_threads: usize,
+    backup_dir: String,
+}
+
+#[derive(Debug, Default)]
+struct RolloutScan {
+    rollout_files: usize,
+    session_meta_count: usize,
+    mismatched_rollouts: usize,
+    mismatched_session_meta: usize,
+    changed_files: Vec<(PathBuf, String)>,
+    thread_ids_with_user_events: HashSet<String>,
+    cwd_by_thread_id: HashMap<String, String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct SqliteScan {
+    sqlite_dbs: usize,
+    sqlite_threads: usize,
+    mismatched_threads: usize,
+    warnings: Vec<String>,
+}
+
 fn io_err(path: &Path, source: std::io::Error) -> CodexxError {
     CodexxError::Io {
         path: path.display().to_string(),
@@ -333,7 +380,6 @@ fn delete_provider_inner(id: &str) -> Result<()> {
     Ok(())
 }
 
-
 fn normalize_prompt_filename(input: &str, fallback: &str) -> String {
     let raw = input.trim().trim_end_matches(".md");
     let base = if raw.is_empty() { fallback } else { raw };
@@ -385,7 +431,13 @@ fn save_prompt_inner(prompt: SavedPrompt) -> Result<SavedPrompt> {
             filename = excluded.filename,
             content = excluded.content,
             updated_at = excluded.updated_at",
-        params![prompt.id, prompt.title, prompt.filename, prompt.content, now],
+        params![
+            prompt.id,
+            prompt.title,
+            prompt.filename,
+            prompt.content,
+            now
+        ],
     )
     .map_err(|e| CodexxError::Database(e.to_string()))?;
     list_saved_prompts_inner()?
@@ -408,7 +460,6 @@ fn delete_prompt_inner(id: &str) -> Result<()> {
     Ok(())
 }
 
-
 fn sanitize_id(input: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -429,7 +480,11 @@ fn sanitize_id(input: &str) -> String {
     }
 }
 
-fn extract_ccswitch_codex_provider(id: &str, name: &str, settings_config: &str) -> Option<SavedProvider> {
+fn extract_ccswitch_codex_provider(
+    id: &str,
+    name: &str,
+    settings_config: &str,
+) -> Option<SavedProvider> {
     let settings: Value = serde_json::from_str(settings_config).ok()?;
     let auth = settings.get("auth");
     let api_key = auth
@@ -445,7 +500,8 @@ fn extract_ccswitch_codex_provider(id: &str, name: &str, settings_config: &str) 
     }
     let doc = config_text.parse::<DocumentMut>().ok()?;
     let model = string_value(&doc, "model").unwrap_or_else(|| "gpt-5.5".to_string());
-    let active_provider = string_value(&doc, "model_provider").unwrap_or_else(|| "custom".to_string());
+    let active_provider =
+        string_value(&doc, "model_provider").unwrap_or_else(|| "custom".to_string());
 
     let provider_table = doc
         .get("model_providers")
@@ -495,7 +551,9 @@ fn extract_ccswitch_codex_provider(id: &str, name: &str, settings_config: &str) 
 }
 
 fn push_existing_candidate(candidates: &mut Vec<PathBuf>, candidate: Option<PathBuf>) {
-    let Some(path) = candidate else { return; };
+    let Some(path) = candidate else {
+        return;
+    };
     if !candidates.iter().any(|item| item == &path) {
         candidates.push(path);
     }
@@ -507,50 +565,112 @@ fn ccswitch_db_candidates() -> Result<Vec<PathBuf>> {
     if let Ok(value) = std::env::var("CC_SWITCH_HOME") {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
-            push_existing_candidate(&mut candidates, Some(PathBuf::from(trimmed).join("cc-switch.db")));
+            push_existing_candidate(
+                &mut candidates,
+                Some(PathBuf::from(trimmed).join("cc-switch.db")),
+            );
         }
     }
 
     let home = home_dir()?;
     // cc-switch 当前主要使用这个位置，macOS/Windows/Linux 都适用。
-    push_existing_candidate(&mut candidates, Some(home.join(".cc-switch").join("cc-switch.db")));
+    push_existing_candidate(
+        &mut candidates,
+        Some(home.join(".cc-switch").join("cc-switch.db")),
+    );
 
     // 兼容 Tauri/AppData 风格位置，防止未来或不同发行版变更数据目录。
     if let Some(data_dir) = dirs::data_dir() {
-        push_existing_candidate(&mut candidates, Some(data_dir.join("com.ccswitch.desktop").join("cc-switch.db")));
-        push_existing_candidate(&mut candidates, Some(data_dir.join("cc-switch").join("cc-switch.db")));
-        push_existing_candidate(&mut candidates, Some(data_dir.join("CC Switch").join("cc-switch.db")));
+        push_existing_candidate(
+            &mut candidates,
+            Some(data_dir.join("com.ccswitch.desktop").join("cc-switch.db")),
+        );
+        push_existing_candidate(
+            &mut candidates,
+            Some(data_dir.join("cc-switch").join("cc-switch.db")),
+        );
+        push_existing_candidate(
+            &mut candidates,
+            Some(data_dir.join("CC Switch").join("cc-switch.db")),
+        );
     }
     if let Some(data_local_dir) = dirs::data_local_dir() {
-        push_existing_candidate(&mut candidates, Some(data_local_dir.join("com.ccswitch.desktop").join("cc-switch.db")));
-        push_existing_candidate(&mut candidates, Some(data_local_dir.join("cc-switch").join("cc-switch.db")));
-        push_existing_candidate(&mut candidates, Some(data_local_dir.join("CC Switch").join("cc-switch.db")));
+        push_existing_candidate(
+            &mut candidates,
+            Some(
+                data_local_dir
+                    .join("com.ccswitch.desktop")
+                    .join("cc-switch.db"),
+            ),
+        );
+        push_existing_candidate(
+            &mut candidates,
+            Some(data_local_dir.join("cc-switch").join("cc-switch.db")),
+        );
+        push_existing_candidate(
+            &mut candidates,
+            Some(data_local_dir.join("CC Switch").join("cc-switch.db")),
+        );
     }
 
     #[cfg(target_os = "macos")]
     {
         push_existing_candidate(
             &mut candidates,
-            Some(home.join("Library").join("Application Support").join("com.ccswitch.desktop").join("cc-switch.db")),
+            Some(
+                home.join("Library")
+                    .join("Application Support")
+                    .join("com.ccswitch.desktop")
+                    .join("cc-switch.db"),
+            ),
         );
     }
 
     #[cfg(target_os = "windows")]
     {
         if let Ok(appdata) = std::env::var("APPDATA") {
-            push_existing_candidate(&mut candidates, Some(PathBuf::from(appdata).join("com.ccswitch.desktop").join("cc-switch.db")));
+            push_existing_candidate(
+                &mut candidates,
+                Some(
+                    PathBuf::from(appdata)
+                        .join("com.ccswitch.desktop")
+                        .join("cc-switch.db"),
+                ),
+            );
         }
         if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
-            push_existing_candidate(&mut candidates, Some(PathBuf::from(localappdata).join("com.ccswitch.desktop").join("cc-switch.db")));
+            push_existing_candidate(
+                &mut candidates,
+                Some(
+                    PathBuf::from(localappdata)
+                        .join("com.ccswitch.desktop")
+                        .join("cc-switch.db"),
+                ),
+            );
         }
     }
 
     #[cfg(target_os = "linux")]
     {
         if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
-            push_existing_candidate(&mut candidates, Some(PathBuf::from(xdg_data_home).join("com.ccswitch.desktop").join("cc-switch.db")));
+            push_existing_candidate(
+                &mut candidates,
+                Some(
+                    PathBuf::from(xdg_data_home)
+                        .join("com.ccswitch.desktop")
+                        .join("cc-switch.db"),
+                ),
+            );
         }
-        push_existing_candidate(&mut candidates, Some(home.join(".local").join("share").join("com.ccswitch.desktop").join("cc-switch.db")));
+        push_existing_candidate(
+            &mut candidates,
+            Some(
+                home.join(".local")
+                    .join("share")
+                    .join("com.ccswitch.desktop")
+                    .join("cc-switch.db"),
+            ),
+        );
     }
 
     Ok(candidates)
@@ -581,7 +701,8 @@ fn import_ccswitch_codex_providers_inner(path: Option<String>) -> Result<ImportR
             .join("\n- ");
         return Err(CodexxError::Config(format!(
             "cc-switch 数据库不存在: {}\n已检查候选路径:\n- {}",
-            db.display(), candidates
+            db.display(),
+            candidates
         )));
     }
 
@@ -589,7 +710,9 @@ fn import_ccswitch_codex_providers_inner(path: Option<String>) -> Result<ImportR
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| CodexxError::Database(format!("打开 cc-switch 数据库失败 {}: {e}", db.display())))?;
+    .map_err(|e| {
+        CodexxError::Database(format!("打开 cc-switch 数据库失败 {}: {e}", db.display()))
+    })?;
 
     let mut stmt = conn
         .prepare("SELECT id, name, settings_config FROM providers WHERE app_type = 'codex' ORDER BY sort_index ASC, created_at ASC")
@@ -618,7 +741,9 @@ fn import_ccswitch_codex_providers_inner(path: Option<String>) -> Result<ImportR
             }
             None => {
                 skipped += 1;
-                warnings.push(format!("跳过 {name} ({id})：未找到可用 config/base_url，可能是官方登录或空模板"));
+                warnings.push(format!(
+                    "跳过 {name} ({id})：未找到可用 config/base_url，可能是官方登录或空模板"
+                ));
             }
         }
     }
@@ -642,7 +767,10 @@ fn default_codex_dir() -> Result<PathBuf> {
 }
 
 fn resolve_codex_dir(config_dir: Option<String>) -> Result<PathBuf> {
-    match config_dir.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    match config_dir
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         Some(path) => Ok(PathBuf::from(path)),
         None => default_codex_dir(),
     }
@@ -656,9 +784,9 @@ fn auth_path(codex_dir: &Path) -> PathBuf {
     codex_dir.join("auth.json")
 }
 
-
-
-fn read_ccswitch_official_auth_inner(path: Option<String>) -> Result<Option<OfficialAuthCandidate>> {
+fn read_ccswitch_official_auth_inner(
+    path: Option<String>,
+) -> Result<Option<OfficialAuthCandidate>> {
     let db = path
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -673,7 +801,9 @@ fn read_ccswitch_official_auth_inner(path: Option<String>) -> Result<Option<Offi
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| CodexxError::Database(format!("打开 cc-switch 数据库失败 {}: {e}", db.display())))?;
+    .map_err(|e| {
+        CodexxError::Database(format!("打开 cc-switch 数据库失败 {}: {e}", db.display()))
+    })?;
 
     let mut stmt = conn
         .prepare(
@@ -688,21 +818,33 @@ fn read_ccswitch_official_auth_inner(path: Option<String>) -> Result<Option<Offi
         .query([])
         .map_err(|e| CodexxError::Database(e.to_string()))?;
 
-    let Some(row) = rows.next().map_err(|e| CodexxError::Database(e.to_string()))? else {
+    let Some(row) = rows
+        .next()
+        .map_err(|e| CodexxError::Database(e.to_string()))?
+    else {
         return Ok(None);
     };
 
-    let id: String = row.get(0).map_err(|e| CodexxError::Database(e.to_string()))?;
-    let name: String = row.get(1).map_err(|e| CodexxError::Database(e.to_string()))?;
-    let settings_config: String = row.get(2).map_err(|e| CodexxError::Database(e.to_string()))?;
-    let settings: Value = serde_json::from_str(&settings_config)
-        .map_err(|e| CodexxError::Database(format!("cc-switch official settings JSON 解析失败: {e}")))?;
+    let id: String = row
+        .get(0)
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    let name: String = row
+        .get(1)
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    let settings_config: String = row
+        .get(2)
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    let settings: Value = serde_json::from_str(&settings_config).map_err(|e| {
+        CodexxError::Database(format!("cc-switch official settings JSON 解析失败: {e}"))
+    })?;
 
     let auth = settings
         .get("auth")
         .cloned()
         .filter(|value| value.is_object())
-        .ok_or_else(|| CodexxError::Database("cc-switch official provider 缺少 auth object".to_string()))?;
+        .ok_or_else(|| {
+            CodexxError::Database("cc-switch official provider 缺少 auth object".to_string())
+        })?;
 
     let model = settings
         .get("config")
@@ -803,7 +945,10 @@ fn create_backup(codex_dir: &Path, action: &str) -> Result<Option<String>> {
         had_config,
         had_auth,
     };
-    write_json(&dir.join("meta.json"), &serde_json::to_value(meta).expect("meta serialize"))?;
+    write_json(
+        &dir.join("meta.json"),
+        &serde_json::to_value(meta).expect("meta serialize"),
+    )?;
     Ok(Some(id))
 }
 
@@ -867,14 +1012,15 @@ fn redacted_auth_preview(path: &Path) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
-
 fn auth_has_material(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
     let text = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| json_err(path, e))?;
-    let Some(obj) = value.as_object() else { return Ok(false); };
+    let Some(obj) = value.as_object() else {
+        return Ok(false);
+    };
     Ok(obj.iter().any(|(key, value)| {
         if key == "auth_mode" {
             return false;
@@ -939,7 +1085,9 @@ fn build_state(codex_dir: PathBuf) -> Result<CodexState> {
     let model = string_value(&doc, "model");
     let model_provider = string_value(&doc, "model_provider");
     let instruction_file = string_value(&doc, "model_instructions_file");
-    let instruction_enabled = instruction_file.as_deref().is_some_and(is_managed_instruction_value);
+    let instruction_enabled = instruction_file
+        .as_deref()
+        .is_some_and(is_managed_instruction_value);
     let providers = extract_providers(&doc, model_provider.as_deref());
 
     Ok(CodexState {
@@ -961,22 +1109,511 @@ fn build_state(codex_dir: PathBuf) -> Result<CodexState> {
     })
 }
 
+fn current_model_provider(codex_dir: &Path, explicit: Option<String>) -> Result<String> {
+    if let Some(provider) = explicit
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(provider);
+    }
+    let cfg = config_path(codex_dir);
+    let text = read_to_string_if_exists(&cfg)?;
+    let doc = parse_toml_document(&cfg, &text)?;
+    Ok(string_value(&doc, "model_provider").unwrap_or_else(|| "openai".to_string()))
+}
+
+fn is_rollout_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+}
+
+fn collect_rollout_paths(root: &Path, out: &mut Vec<PathBuf>, warnings: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        if root.exists() {
+            warnings.push(format!("无法读取目录: {}", root.display()));
+        }
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_paths(&path, out, warnings);
+        } else if is_rollout_file(&path) {
+            out.push(path);
+        }
+    }
+}
+
+fn split_line_ending(segment: &str) -> (&str, &str) {
+    if let Some(line) = segment.strip_suffix("\r\n") {
+        (line, "\r\n")
+    } else if let Some(line) = segment.strip_suffix('\n') {
+        (line, "\n")
+    } else {
+        (segment, "")
+    }
+}
+
+fn normalize_workspace_path(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with(r"\\?\unc\") {
+        return Some(format!(r"\\{}", trimmed[8..].replace('/', r"\")));
+    }
+    if trimmed.starts_with(r"\\?\") {
+        return Some(trimmed[4..].replace('\\', "/"));
+    }
+    Some(trimmed.to_string())
+}
+
+fn scan_rollouts(codex_dir: &Path, target_provider: &str, rewrite: bool) -> Result<RolloutScan> {
+    let mut paths = Vec::new();
+    let mut scan = RolloutScan::default();
+    for dir in ["sessions", "archived_sessions"] {
+        collect_rollout_paths(&codex_dir.join(dir), &mut paths, &mut scan.warnings);
+    }
+    paths.sort();
+    scan.rollout_files = paths.len();
+
+    for path in paths {
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e)
+                if matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
+                    || matches!(e.raw_os_error(), Some(32 | 33)) =>
+            {
+                scan.warnings
+                    .push(format!("跳过被占用/无权限会话文件: {}", path.display()));
+                continue;
+            }
+            Err(e) => return Err(io_err(&path, e)),
+        };
+        let mut next = String::with_capacity(text.len());
+        let mut file_has_meta = false;
+        let mut file_changed = false;
+        let has_user_event = text.contains("\"user_message\"") || text.contains("\"user_input\"");
+        let mut first_thread_id: Option<String> = None;
+        let mut first_cwd: Option<String> = None;
+
+        for segment in text.split_inclusive('\n') {
+            let (line, ending) = split_line_ending(segment);
+            let mut next_line = line.to_string();
+            if !line.trim().is_empty() {
+                if let Ok(mut record) = serde_json::from_str::<Value>(line) {
+                    if record.get("type").and_then(Value::as_str) == Some("session_meta") {
+                        file_has_meta = true;
+                        scan.session_meta_count += 1;
+                        if let Some(payload) =
+                            record.get_mut("payload").and_then(Value::as_object_mut)
+                        {
+                            if first_thread_id.is_none() {
+                                first_thread_id = payload
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .map(ToString::to_string);
+                            }
+                            if first_cwd.is_none() {
+                                first_cwd = payload
+                                    .get("cwd")
+                                    .and_then(Value::as_str)
+                                    .and_then(normalize_workspace_path);
+                            }
+                            if payload.get("model_provider").and_then(Value::as_str)
+                                != Some(target_provider)
+                            {
+                                scan.mismatched_session_meta += 1;
+                                file_changed = true;
+                                if rewrite {
+                                    payload.insert(
+                                        "model_provider".to_string(),
+                                        json!(target_provider),
+                                    );
+                                    next_line = serde_json::to_string(&record)
+                                        .map_err(|e| json_err(&path, e))?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            next.push_str(&next_line);
+            next.push_str(ending);
+        }
+        if file_has_meta {
+            if has_user_event {
+                if let Some(id) = &first_thread_id {
+                    scan.thread_ids_with_user_events.insert(id.clone());
+                }
+            }
+            if let (Some(id), Some(cwd)) = (&first_thread_id, &first_cwd) {
+                scan.cwd_by_thread_id.insert(id.clone(), cwd.clone());
+            }
+        }
+        if file_changed {
+            scan.mismatched_rollouts += 1;
+            if rewrite {
+                scan.changed_files.push((path, next));
+            }
+        }
+    }
+    Ok(scan)
+}
+
+fn sqlite_candidate_paths(codex_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let sqlite_dir = codex_dir.join("sqlite");
+    if let Ok(entries) = fs::read_dir(&sqlite_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("");
+            if matches!(ext, "db" | "sqlite" | "sqlite3") {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    let legacy = codex_dir.join("state_5.sqlite");
+    if legacy.exists() && !paths.iter().any(|p| p == &legacy) {
+        paths.push(legacy);
+    }
+    paths
+}
+
+fn sqlite_has_table(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        [table],
+        |_| Ok(()),
+    )
+    .map(|_| true)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(false),
+        other => Err(CodexxError::Database(other.to_string())),
+    })
+}
+
+fn table_column_set(conn: &Connection, table: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "PRAGMA table_info(\"{}\")",
+            table.replace('"', "\"\"")
+        ))
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    let mut cols = HashSet::new();
+    for row in rows {
+        cols.insert(row.map_err(|e| CodexxError::Database(e.to_string()))?);
+    }
+    Ok(cols)
+}
+
+fn scan_sqlite(codex_dir: &Path, target_provider: &str) -> Result<SqliteScan> {
+    let mut scan = SqliteScan::default();
+    for path in sqlite_candidate_paths(codex_dir) {
+        let conn = match Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(conn) => conn,
+            Err(e) => {
+                scan.warnings
+                    .push(format!("无法读取 SQLite: {} ({e})", path.display()));
+                continue;
+            }
+        };
+        if !sqlite_has_table(&conn, "threads")? {
+            continue;
+        }
+        let cols = table_column_set(&conn, "threads")?;
+        if !cols.contains("model_provider") {
+            scan.warnings.push(format!(
+                "SQLite threads 缺少 model_provider 字段: {}",
+                path.display()
+            ));
+            continue;
+        }
+        scan.sqlite_dbs += 1;
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+        let mismatch: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider, '') <> ?1",
+                [target_provider],
+                |row| row.get(0),
+            )
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+        scan.sqlite_threads += total.max(0) as usize;
+        scan.mismatched_threads += mismatch.max(0) as usize;
+    }
+    Ok(scan)
+}
+
+fn provider_sync_backup_root(codex_dir: &Path) -> PathBuf {
+    codex_dir.join("backups_state").join("provider-sync")
+}
+
+fn copy_file_to_backup(codex_dir: &Path, backup_dir: &Path, source: &Path) -> Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    let relative = source.strip_prefix(codex_dir).unwrap_or(source);
+    let target = backup_dir.join(relative);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    }
+    fs::copy(source, &target).map_err(|e| io_err(source, e))?;
+    Ok(())
+}
+
+fn prune_provider_sync_backups(codex_dir: &Path) -> Result<()> {
+    let root = provider_sync_backup_root(codex_dir);
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|e| io_err(&root, e))? {
+        let entry = entry.map_err(|e| io_err(&root, e))?;
+        let path = entry.path();
+        if path.is_dir() && path.join("metadata.json").exists() {
+            dirs.push(path);
+        }
+    }
+    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    for path in dirs.into_iter().skip(5) {
+        let _ = fs::remove_dir_all(path);
+    }
+    Ok(())
+}
+
+fn create_provider_sync_backup(
+    codex_dir: &Path,
+    target_provider: &str,
+    changed_rollouts: &[PathBuf],
+) -> Result<PathBuf> {
+    let root = provider_sync_backup_root(codex_dir);
+    fs::create_dir_all(&root).map_err(|e| io_err(&root, e))?;
+    let mut backup_dir = root.join(Local::now().format("%Y%m%d%H%M%S").to_string());
+    let mut suffix = 0;
+    while backup_dir.exists() {
+        suffix += 1;
+        backup_dir = root.join(format!("{}-{suffix}", Local::now().format("%Y%m%d%H%M%S")));
+    }
+    fs::create_dir_all(&backup_dir).map_err(|e| io_err(&backup_dir, e))?;
+
+    for name in [
+        "config.toml",
+        ".codex-global-state.json",
+        ".codex-global-state.json.bak",
+    ] {
+        copy_file_to_backup(codex_dir, &backup_dir, &codex_dir.join(name))?;
+    }
+    for path in sqlite_candidate_paths(codex_dir) {
+        for candidate in [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            copy_file_to_backup(codex_dir, &backup_dir, &candidate)?;
+        }
+    }
+    for path in changed_rollouts {
+        copy_file_to_backup(codex_dir, &backup_dir, path)?;
+    }
+    write_json(
+        &backup_dir.join("metadata.json"),
+        &json!({
+            "version": 1,
+            "namespace": "provider-sync",
+            "managedBy": "Codex-X session manager",
+            "codexHome": codex_dir.display().to_string(),
+            "targetProvider": target_provider,
+            "createdAt": Local::now().to_rfc3339(),
+            "changedRolloutFiles": changed_rollouts.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        }),
+    )?;
+    prune_provider_sync_backups(codex_dir)?;
+    Ok(backup_dir)
+}
+
+fn apply_sqlite_provider_sync(
+    codex_dir: &Path,
+    target_provider: &str,
+    thread_ids_with_user_events: &HashSet<String>,
+    cwd_by_thread_id: &HashMap<String, String>,
+) -> Result<usize> {
+    let mut updated = 0usize;
+    for path in sqlite_candidate_paths(codex_dir) {
+        let mut conn = match Connection::open(&path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                return Err(CodexxError::Database(format!(
+                    "打开 SQLite 失败 {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        if !sqlite_has_table(&conn, "threads")? {
+            continue;
+        }
+        let cols = table_column_set(&conn, "threads")?;
+        if !cols.contains("model_provider") {
+            continue;
+        }
+        let tx = conn
+            .transaction()
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+        updated += tx
+            .execute(
+                "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
+                [target_provider],
+            )
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+        if cols.contains("has_user_event") {
+            for id in thread_ids_with_user_events {
+                updated += tx
+                    .execute("UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1", [id])
+                    .map_err(|e| CodexxError::Database(e.to_string()))?;
+            }
+        }
+        if cols.contains("cwd") {
+            for (id, cwd) in cwd_by_thread_id {
+                updated += tx
+                    .execute(
+                        "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
+                        (cwd, id),
+                    )
+                    .map_err(|e| CodexxError::Database(e.to_string()))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+    }
+    Ok(updated)
+}
+
+fn session_sync_status_inner(
+    config_dir: Option<String>,
+    target_provider: Option<String>,
+) -> Result<SessionSyncStatus> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    let target = current_model_provider(&codex_dir, target_provider)?;
+    let rollouts = scan_rollouts(&codex_dir, &target, false)?;
+    let sqlite = scan_sqlite(&codex_dir, &target)?;
+    let mut warnings = rollouts.warnings;
+    warnings.extend(sqlite.warnings);
+    Ok(SessionSyncStatus {
+        codex_dir: codex_dir.display().to_string(),
+        target_provider: target,
+        rollout_files: rollouts.rollout_files,
+        session_meta_count: rollouts.session_meta_count,
+        mismatched_rollouts: rollouts.mismatched_rollouts,
+        mismatched_session_meta: rollouts.mismatched_session_meta,
+        sqlite_dbs: sqlite.sqlite_dbs,
+        sqlite_threads: sqlite.sqlite_threads,
+        mismatched_threads: sqlite.mismatched_threads,
+        needs_sync: rollouts.mismatched_session_meta > 0 || sqlite.mismatched_threads > 0,
+        backup_dir: None,
+        warnings,
+    })
+}
+
+fn sync_sessions_provider_inner(
+    config_dir: Option<String>,
+    target_provider: Option<String>,
+) -> Result<SessionSyncResult> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
+    let target = current_model_provider(&codex_dir, target_provider)?;
+    let lock_dir = codex_dir.join("tmp").join("provider-sync.lock");
+    fs::create_dir_all(lock_dir.parent().unwrap_or(&codex_dir))
+        .map_err(|e| io_err(lock_dir.parent().unwrap_or(&codex_dir), e))?;
+    if lock_dir.exists() {
+        return Err(CodexxError::Config(format!(
+            "会话同步锁已存在: {}",
+            lock_dir.display()
+        )));
+    }
+    fs::create_dir_all(&lock_dir).map_err(|e| io_err(&lock_dir, e))?;
+
+    let result = (|| -> Result<SessionSyncResult> {
+        let rollouts = scan_rollouts(&codex_dir, &target, true)?;
+        let sqlite_before = scan_sqlite(&codex_dir, &target)?;
+        let changed_paths = rollouts
+            .changed_files
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect::<Vec<_>>();
+        let backup_dir = create_provider_sync_backup(&codex_dir, &target, &changed_paths)?;
+
+        let mut updated_rollouts = 0usize;
+        for (path, text) in &rollouts.changed_files {
+            write_text(path, text)?;
+            updated_rollouts += 1;
+        }
+        let updated_threads = apply_sqlite_provider_sync(
+            &codex_dir,
+            &target,
+            &rollouts.thread_ids_with_user_events,
+            &rollouts.cwd_by_thread_id,
+        )?;
+        let mut status =
+            session_sync_status_inner(Some(codex_dir.display().to_string()), Some(target.clone()))?;
+        status.backup_dir = Some(backup_dir.display().to_string());
+        if rollouts.changed_files.is_empty() && sqlite_before.mismatched_threads == 0 {
+            status
+                .warnings
+                .push("没有发现需要修复的会话；已保留一次安全备份。".to_string());
+        }
+        Ok(SessionSyncResult {
+            status,
+            updated_rollouts,
+            updated_threads,
+            backup_dir: backup_dir.display().to_string(),
+        })
+    })();
+
+    let _ = fs::remove_dir_all(&lock_dir);
+    result
+}
 
 fn instruction_template(template_id: &str) -> Result<(&'static str, &'static str, &'static str)> {
     match template_id.trim() {
-        "gpt5.4-unrestricted" => Ok((INSTRUCTION_54_FILENAME, INSTRUCTION_54_RELATIVE, INSTRUCTION_54_CONTENT)),
-        "gpt5.5-unrestricted" | "" => Ok((INSTRUCTION_FILENAME, INSTRUCTION_RELATIVE, INSTRUCTION_CONTENT)),
+        "gpt5.4-unrestricted" => Ok((
+            INSTRUCTION_54_FILENAME,
+            INSTRUCTION_54_RELATIVE,
+            INSTRUCTION_54_CONTENT,
+        )),
+        "gpt5.5-unrestricted" | "" => Ok((
+            INSTRUCTION_FILENAME,
+            INSTRUCTION_RELATIVE,
+            INSTRUCTION_CONTENT,
+        )),
         other => Err(CodexxError::Config(format!("未知指令提示词模板: {other}"))),
     }
 }
 
 fn is_managed_instruction_value(value: &str) -> bool {
-    [INSTRUCTION_FILENAME, INSTRUCTION_54_FILENAME].iter().any(|filename| {
-        value == format!("./{filename}")
-            || value == *filename
-            || value.ends_with(&format!("/{filename}"))
-            || value.ends_with(&format!("\\{filename}"))
-    })
+    [INSTRUCTION_FILENAME, INSTRUCTION_54_FILENAME]
+        .iter()
+        .any(|filename| {
+            value == format!("./{filename}")
+                || value == *filename
+                || value.ends_with(&format!("/{filename}"))
+                || value.ends_with(&format!("\\{filename}"))
+        })
 }
 
 fn set_top_level_defaults(doc: &mut DocumentMut) {
@@ -998,6 +1635,21 @@ fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Table> {
         .ok_or_else(|| CodexxError::Config(format!("{key} 不是 TOML table")))
 }
 
+#[tauri::command]
+fn get_session_sync_status(
+    config_dir: Option<String>,
+    target_provider: Option<String>,
+) -> Result<SessionSyncStatus> {
+    session_sync_status_inner(config_dir, target_provider)
+}
+
+#[tauri::command]
+fn sync_sessions_provider(
+    config_dir: Option<String>,
+    target_provider: Option<String>,
+) -> Result<SessionSyncResult> {
+    sync_sessions_provider_inner(config_dir, target_provider)
+}
 
 #[tauri::command]
 fn read_ccswitch_official_auth(db_path: Option<String>) -> Result<Option<OfficialAuthCandidate>> {
@@ -1015,24 +1667,38 @@ fn command_version(program: &str, args: &[&str]) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn macos_codex_app_version() -> Option<String> {
     let output = Command::new("/usr/libexec/PlistBuddy")
-        .args(["-c", "Print :CFBundleShortVersionString", "/Applications/Codex.app/Contents/Info.plist"])
+        .args([
+            "-c",
+            "Print :CFBundleShortVersionString",
+            "/Applications/Codex.app/Contents/Info.plist",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn macos_codex_app_version() -> Option<String> { None }
+fn macos_codex_app_version() -> Option<String> {
+    None
+}
 
 fn detect_codex_version() -> Option<String> {
     command_version("codex", &["--version"])
@@ -1073,7 +1739,12 @@ fn save_prompt(prompt: SavedPrompt) -> Result<SavedPrompt> {
         sanitize_id(&prompt.id)
     };
     let filename = normalize_prompt_filename(&prompt.filename, &id);
-    save_prompt_inner(SavedPrompt { id, title, filename, content })
+    save_prompt_inner(SavedPrompt {
+        id,
+        title,
+        filename,
+        content,
+    })
 }
 
 #[tauri::command]
@@ -1119,7 +1790,10 @@ fn save_provider(provider: SavedProvider) -> Result<SavedProvider> {
         provider_name: provider.provider_name.trim().to_string(),
         base_url: provider.base_url.trim().trim_end_matches('/').to_string(),
         model: provider.model.trim().to_string(),
-        api_key: provider.api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        api_key: provider
+            .api_key
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         wire_api: if provider.wire_api.trim().is_empty() {
             "responses".to_string()
         } else {
@@ -1153,8 +1827,6 @@ fn get_codex_state(config_dir: Option<String>) -> Result<CodexState> {
     build_state(codex_dir)
 }
 
-
-
 fn apply_official_config(
     config_dir: Option<String>,
     model: Option<String>,
@@ -1186,16 +1858,24 @@ fn apply_official_config(
         doc.as_table_mut().remove("model_providers");
     }
 
-    if let Some(model) = model.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(model) = model
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         doc["model"] = value(model);
     }
 
     write_text(&cfg, &doc.to_string())?;
 
-    if let Some(auth_json) = auth_json.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(auth_json) = auth_json
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         let parsed: Value = serde_json::from_str(&auth_json).map_err(|e| json_err(&auth, e))?;
         if !parsed.is_object() {
-            return Err(CodexxError::Config("auth.json 必须是 JSON object".to_string()));
+            return Err(CodexxError::Config(
+                "auth.json 必须是 JSON object".to_string(),
+            ));
         }
         write_json(&auth, &parsed)?;
     }
@@ -1263,12 +1943,18 @@ fn enable_instruction(config_dir: Option<String>) -> Result<ActionResult> {
 }
 
 #[tauri::command]
-fn enable_instruction_template(config_dir: Option<String>, template_id: String) -> Result<ActionResult> {
+fn enable_instruction_template(
+    config_dir: Option<String>,
+    template_id: String,
+) -> Result<ActionResult> {
     enable_instruction_inner(config_dir, &template_id)
 }
 
 #[tauri::command]
-fn disable_instruction(config_dir: Option<String>, delete_file: Option<bool>) -> Result<ActionResult> {
+fn disable_instruction(
+    config_dir: Option<String>,
+    delete_file: Option<bool>,
+) -> Result<ActionResult> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     let cfg = config_path(&codex_dir);
     let backup_id = create_backup(&codex_dir, "disable-instruct")?;
@@ -1315,11 +2001,17 @@ fn save_provider_toml_config(input: ProviderTomlInput) -> Result<ActionResult> {
     let config_text = input.config_text.trim_end().to_string();
     let doc = parse_toml_document(&cfg, &config_text)?;
     if string_value(&doc, "model").is_none() {
-        return Err(CodexxError::Config("config.toml 必须包含 model".to_string()));
+        return Err(CodexxError::Config(
+            "config.toml 必须包含 model".to_string(),
+        ));
     }
     write_text(&cfg, &(config_text + "\n"))?;
 
-    if let Some(api_key) = input.api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(api_key) = input
+        .api_key
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         let mut auth_value = if auth.exists() {
             let text = fs::read_to_string(&auth).map_err(|e| io_err(&auth, e))?;
             serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}))
@@ -1379,7 +2071,11 @@ fn switch_provider(input: ProviderInput) -> Result<ActionResult> {
 
     write_text(&cfg, &doc.to_string())?;
 
-    if let Some(api_key) = input.api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(api_key) = input
+        .api_key
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         let mut auth_value = if auth.exists() {
             let text = fs::read_to_string(&auth).map_err(|e| io_err(&auth, e))?;
             serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}))
@@ -1455,7 +2151,9 @@ fn open_url(url: String) -> std::result::Result<(), String> {
     let status = if cfg!(target_os = "macos") {
         Command::new("open").arg(trimmed).status()
     } else if cfg!(target_os = "windows") {
-        Command::new("cmd").args(["/C", "start", "", trimmed]).status()
+        Command::new("cmd")
+            .args(["/C", "start", "", trimmed])
+            .status()
     } else {
         Command::new("xdg-open").arg(trimmed).status()
     };
@@ -1471,6 +2169,8 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_about_info,
+            get_session_sync_status,
+            sync_sessions_provider,
             read_ccswitch_official_auth,
             import_ccswitch_codex_providers,
             list_saved_prompts,

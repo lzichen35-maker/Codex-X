@@ -2,6 +2,13 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [v0.2.8] - 2026-07-04
+
+- 更新页进一步产品化：去掉资源/仓库调试信息，将“有更新”改为更明显的绿色标签。
+- 概览页顶部新增轻量“发现新版本”提示条，可直接打开 Releases 页面。
+- 新增【会话管理】页面：检查 Codex 本地 sessions / archived_sessions 与 SQLite threads 是否和当前 Provider 同步。
+- 新增一键 Provider Sync / 修复历史会话：写入前备份到 `~/.codex/backups_state/provider-sync/`，并保留最近 5 份备份。
+
 ## [v0.2.7] - 2026-07-04
 
 - 简化更新检查页展示。

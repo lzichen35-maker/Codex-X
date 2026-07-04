@@ -6,6 +6,7 @@ import {
   Code2,
   Download,
   ExternalLink,
+  AlertCircle,
   FileCode2,
   Globe2,
   History,
@@ -29,7 +30,7 @@ import "./styles.css";
 type Lang = "zh" | "en";
 type ProviderMode = "list" | "form" | "official";
 type InstructionMode = "list" | "form";
-type Tab = "dashboard" | "provider" | "instruction" | "toml" | "settings" | "about";
+type Tab = "dashboard" | "provider" | "sessions" | "instruction" | "toml" | "settings" | "about";
 
 type InstructionTemplate = {
   id: string;
@@ -130,6 +131,29 @@ type ReleaseInfo = {
   hasUpdate?: boolean;
 };
 
+
+type SessionSyncStatus = {
+  codexDir: string;
+  targetProvider: string;
+  rolloutFiles: number;
+  sessionMetaCount: number;
+  mismatchedRollouts: number;
+  mismatchedSessionMeta: number;
+  sqliteDbs: number;
+  sqliteThreads: number;
+  mismatchedThreads: number;
+  needsSync: boolean;
+  backupDir?: string | null;
+  warnings: string[];
+};
+
+type SessionSyncResult = {
+  status: SessionSyncStatus;
+  updatedRollouts: number;
+  updatedThreads: number;
+  backupDir: string;
+};
+
 const INSTRUCTION_RELATIVE_UI = "./gpt5.5-unrestricted.md";
 const LANG_KEY = "codexx.lang";
 const FALLBACK_GITHUB_REPO = "yynxxxxx/Codex-X";
@@ -187,6 +211,7 @@ const dict = {
     nav: {
       dashboard: "概览",
       provider: "供应商",
+      sessions: "会话管理",
       instruction: "指令提示词",
       toml: "TOML",
       settings: "设置",
@@ -293,6 +318,7 @@ const dict = {
     nav: {
       dashboard: "Overview",
       provider: "Provider",
+      sessions: "Sessions",
       instruction: "Prompt",
       toml: "TOML",
       settings: "Settings",
@@ -661,6 +687,7 @@ function App() {
   const [aboutInfo, setAboutInfo] = React.useState<AboutInfo | null>(null);
   const [releaseInfo, setReleaseInfo] = React.useState<ReleaseInfo>({ status: "idle" });
   const [updatePromptOpen, setUpdatePromptOpen] = React.useState(false);
+  const [sessionStatus, setSessionStatus] = React.useState<SessionSyncStatus | null>(null);
   const [state, setState] = React.useState<CodexState | null>(null);
   const [backups, setBackups] = React.useState<BackupEntry[]>([]);
   const [configDir, setConfigDir] = React.useState("");
@@ -768,14 +795,16 @@ function App() {
         const providerList = await invoke<SavedProvider[]>("list_saved_providers");
         const promptList = await invoke<SavedPrompt[]>("list_saved_prompts");
         const about = await invoke<AboutInfo>("get_about_info", { configDir: configDir || null });
-        return { next, backupList, providerList, promptList, about };
+        const sessions = await invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || null, targetProvider: null });
+        return { next, backupList, providerList, promptList, about, sessions };
       },
-      ({ next, backupList, providerList, promptList, about }) => {
+      ({ next, backupList, providerList, promptList, about, sessions }) => {
         setState(next);
         setBackups(backupList);
         setSavedProviders(providerList);
         setSavedPrompts(promptList);
         setAboutInfo(about);
+        setSessionStatus(sessions);
         if (!configDir) setConfigDir(next.codexDir);
       },
     );
@@ -1102,9 +1131,32 @@ function App() {
     );
   };
 
+  const checkSessions = () =>
+    call(
+      () => invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || null, targetProvider: null }),
+      (status) => {
+        setSessionStatus(status);
+        setToast(status.needsSync
+          ? (lang === "zh" ? `发现 ${status.mismatchedSessionMeta + status.mismatchedThreads} 项需要同步` : "Session sync needed")
+          : (lang === "zh" ? "会话已同步" : "Sessions are in sync"));
+      },
+    );
+
+  const syncSessions = () =>
+    call(
+      () => invoke<SessionSyncResult>("sync_sessions_provider", { configDir: configDir || null, targetProvider: null }),
+      (result) => {
+        setSessionStatus(result.status);
+        setToast(lang === "zh"
+          ? `已修复 ${result.updatedRollouts} 个会话文件、${result.updatedThreads} 条 SQLite 记录`
+          : `Updated ${result.updatedRollouts} rollout file(s), ${result.updatedThreads} SQLite row(s)`);
+      },
+    );
+
   const navItems: Array<[Tab, string, React.ReactNode]> = [
     ["dashboard", t.nav.dashboard, <Layers3 size={18} />],
     ["provider", t.nav.provider, <Zap size={18} />],
+    ["sessions", t.nav.sessions, <History size={18} />],
     ["instruction", t.nav.instruction, <Sparkles size={18} />],
     ["toml", t.nav.toml, <FileCode2 size={18} />],
     ["settings", t.nav.settings, <Settings size={18} />],
@@ -1202,6 +1254,19 @@ function App() {
         ) : (
           <>
             {tab === "dashboard" && (
+              <>
+                {releaseInfo.status === "ok" && releaseInfo.hasUpdate && (
+                  <div className="update-strip glass">
+                    <div>
+                      <span className="update-dot" />
+                      <strong>{lang === "zh" ? "发现新版本" : "New version found"}</strong>
+                      <p>{lang === "zh" ? `Codex-X ${releaseInfo.latestVersion || ""} 已发布` : `Codex-X ${releaseInfo.latestVersion || ""} is available`}</p>
+                    </div>
+                    <button className="secondary-btn small" onClick={() => releaseInfo.htmlUrl && void invoke("open_url", { url: releaseInfo.htmlUrl })}>
+                      {lang === "zh" ? "查看更新" : "View"}
+                    </button>
+                  </div>
+                )}
               <div className="grid dashboard-grid">
                 <StatCard icon={<TerminalSquare size={20} />} label={t.dashboard.config} value={state.configExists ? t.dashboard.found : t.dashboard.missing} ok={state.configExists} />
                 <StatCard icon={<Code2 size={20} />} label={t.dashboard.provider} value={currentProvider?.name || state.modelProvider || t.dashboard.officialDefault} ok={Boolean(state.modelProvider)} />
@@ -1234,6 +1299,7 @@ function App() {
                   </div>
                 </section>
               </div>
+              </>
             )}
 
             {tab === "provider" && (
@@ -1396,6 +1462,63 @@ function App() {
               </section>
             )}
 
+            {tab === "sessions" && (
+              <section className="panel glass sessions-panel">
+                <div className="panel-head provider-title-row">
+                  <div>
+                    <p className="eyebrow">Provider Sync</p>
+                    <h3>{lang === "zh" ? "会话管理" : "Session management"}</h3>
+                    <p className="muted-desc">
+                      {lang === "zh"
+                        ? "检查并修复 Codex 本地历史会话的 Provider 元数据，让切换供应商后旧 thread 仍能被原生 Codex 识别、打开和续聊。"
+                        : "Check and repair local Codex session provider metadata so old threads stay visible and resumable after provider switching."}
+                    </p>
+                  </div>
+                  <div className="provider-title-actions">
+                    <button className="secondary-btn add-provider-btn" onClick={checkSessions} disabled={loading}>
+                      <RefreshCw size={18} className={cx(loading && "spin")} /> {lang === "zh" ? "检查会话" : "Check"}
+                    </button>
+                    <button className="primary-btn add-provider-btn" onClick={syncSessions} disabled={loading || !sessionStatus?.needsSync}>
+                      <Zap size={18} /> {lang === "zh" ? "同步 / 修复" : "Sync / repair"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className={cx("session-status-card", sessionStatus?.needsSync ? "needs-sync" : "synced")}>
+                  <div className="session-status-icon">
+                    {sessionStatus?.needsSync ? <AlertCircle size={24} /> : <CheckCircle2 size={24} />}
+                  </div>
+                  <div>
+                    <strong>{sessionStatus?.needsSync ? (lang === "zh" ? "发现未同步会话" : "Unsynced sessions found") : (lang === "zh" ? "会话已同步" : "Sessions are in sync")}</strong>
+                    <p>{lang === "zh"
+                      ? `目标 Provider：${sessionStatus?.targetProvider || state.modelProvider || "openai"}`
+                      : `Target provider: ${sessionStatus?.targetProvider || state.modelProvider || "openai"}`}</p>
+                  </div>
+                  {sessionStatus?.needsSync && <StatusPill active label={lang === "zh" ? "需要修复" : "Needs repair"} />}
+                </div>
+
+                <div className="session-stat-grid">
+                  <StatCard icon={<FileCode2 size={20} />} label={lang === "zh" ? "rollout 文件" : "Rollout files"} value={sessionStatus?.rolloutFiles ?? "-"} ok />
+                  <StatCard icon={<Sparkles size={20} />} label={lang === "zh" ? "session_meta" : "session_meta"} value={sessionStatus?.sessionMetaCount ?? "-"} ok />
+                  <StatCard icon={<AlertCircle size={20} />} label={lang === "zh" ? "未同步 JSONL" : "Unsynced JSONL"} value={sessionStatus?.mismatchedRollouts ?? "-"} ok={!sessionStatus?.mismatchedRollouts} />
+                  <StatCard icon={<Layers3 size={20} />} label={lang === "zh" ? "SQLite threads" : "SQLite threads"} value={sessionStatus?.sqliteThreads ?? "-"} ok />
+                  <StatCard icon={<AlertCircle size={20} />} label={lang === "zh" ? "未同步记录" : "Unsynced rows"} value={sessionStatus?.mismatchedThreads ?? "-"} ok={!sessionStatus?.mismatchedThreads} />
+                  <StatCard icon={<Code2 size={20} />} label={lang === "zh" ? "SQLite 数据库" : "SQLite DBs"} value={sessionStatus?.sqliteDbs ?? "-"} ok />
+                </div>
+
+                <div className="session-info-list">
+                  <div><span>CODEX_HOME</span><code>{sessionStatus?.codexDir || state.codexDir}</code></div>
+                  <div><span>{lang === "zh" ? "备份位置" : "Backup"}</span><code>{sessionStatus?.backupDir || `${state.codexDir}/backups_state/provider-sync`}</code></div>
+                </div>
+
+                {sessionStatus?.warnings?.length ? (
+                  <div className="session-warning-list">
+                    {sessionStatus.warnings.map((item, index) => <p key={index}><AlertCircle size={15} /> {item}</p>)}
+                  </div>
+                ) : null}
+              </section>
+            )}
+
             {tab === "instruction" && (
               <section className="panel glass instruction-panel simple-instruction-panel">
                 {instructionMode === "list" ? (
@@ -1532,13 +1655,11 @@ function App() {
                 <section className="panel glass about-card">
                   <div className="panel-head compact">
                     <div><p className="eyebrow">GitHub Releases</p><h3>{lang === "zh" ? "更新检查" : "Update check"}</h3></div>
-                    <StatusPill active={releaseInfo.status === "ok" && Boolean(releaseInfo.hasUpdate)} label={releaseStatusLabel} />
+                    <span className={cx("update-status-pill", releaseInfo.hasUpdate && "available")}>{releaseStatusLabel}</span>
                   </div>
                   <div className="about-kv">
                     <div><span>{lang === "zh" ? "状态" : "Status"}</span><strong>{releaseStatusLabel}</strong></div>
                     <div><span>{lang === "zh" ? "最新版本" : "Latest"}</span><strong>{releaseInfo.latestVersion || "-"}</strong></div>
-                    <div><span>{lang === "zh" ? "资源" : "Asset"}</span><code>{releaseInfo.assetName || "-"}</code></div>
-                    <div><span>{lang === "zh" ? "仓库" : "Repo"}</span><code>{aboutInfo?.githubRepo || FALLBACK_GITHUB_REPO}</code></div>
                   </div>
                   <div className="about-actions">
                     <button className="primary-btn" onClick={() => void checkForUpdates()} disabled={releaseInfo.status === "checking"}><RefreshCw size={16} className={cx(releaseInfo.status === "checking" && "spin")} /> {lang === "zh" ? "检查更新" : "Check updates"}</button>
