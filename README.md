@@ -129,7 +129,7 @@ Codex-X 不是普通的配置文件编辑器，而是一个面向 Codex CLI 的 
   </tr>
   <tr>
     <td align="center">📦 跨平台发布</td>
-    <td>提供 macOS <code>.dmg</code>、Windows <code>.msi</code>、Linux <code>.deb</code> / <code>.rpm</code>，支持应用内检测更新。</td>
+    <td>提供 macOS Apple Silicon / Intel <code>.dmg</code>、Windows <code>.msi</code> / portable <code>.zip</code>、Linux <code>.deb</code> / <code>.rpm</code>，支持应用内检测更新。</td>
   </tr>
 </table>
 </div>
@@ -230,8 +230,10 @@ Codex-X 可以读取 Codex 本地会话数据：
 
 ### 6. 跨平台桌面软件
 
-- macOS `.dmg`
+- macOS Apple Silicon `.dmg`
+- macOS Intel `.dmg`
 - Windows `.msi`
+- Windows Portable `.zip`
 - Linux `.deb` / `.rpm`
 - GitHub Releases 自动构建发布
 - 应用内检查更新

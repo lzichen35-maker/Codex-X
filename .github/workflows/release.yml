@@ -21,10 +21,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS
+          - name: macOS Apple Silicon
             platform: macos-latest
             args: --bundles dmg
-            artifact: codex-x-macos
+            artifact: codex-x-macos-arm64
+            paths: |
+              apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          - name: macOS Intel
+            platform: macos-13
+            args: --bundles dmg
+            artifact: codex-x-macos-x64
             paths: |
               apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
           - name: Linux
@@ -40,6 +46,7 @@ jobs:
             artifact: codex-x-windows
             paths: |
               apps/desktop/src-tauri/target/release/bundle/msi/*.msi
+              apps/desktop/src-tauri/Codex-X_*_windows_x64_portable.zip
 
     steps:
       - name: Checkout
@@ -80,6 +87,23 @@ jobs:
 
       - name: Build Tauri bundles
         run: pnpm --dir apps/desktop tauri build ${{ matrix.args }}
+
+      - name: Create Windows portable zip
+        if: matrix.platform == 'windows-latest'
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./apps/desktop/package.json').version")
+          portable_dir="apps/desktop/src-tauri/portable/Codex-X_${version}_windows_x64_portable"
+          rm -rf "apps/desktop/src-tauri/portable"
+          mkdir -p "$portable_dir"
+          cp apps/desktop/src-tauri/target/release/codex-x.exe "$portable_dir/Codex-X.exe"
+          cat > "$portable_dir/README-portable.txt" <<'EOF'
+          Codex-X Windows Portable
+
+          Double click Codex-X.exe to run. No MSI installation is required.
+          Microsoft Edge WebView2 Runtime is required; Windows 10/11 usually already includes it.
+          EOF
+          powershell -NoProfile -Command "Compress-Archive -Path 'apps/desktop/src-tauri/portable/Codex-X_${version}_windows_x64_portable/*' -DestinationPath 'apps/desktop/src-tauri/Codex-X_${version}_windows_x64_portable.zip' -Force"
 
       - name: Upload bundle artifacts
         uses: actions/upload-artifact@v4
@@ -139,7 +163,7 @@ jobs:
           else
             gh release create "$tag" --title "$title" --notes-file release-body.md --latest
           fi
-          mapfile -t assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.deb' -o -name '*.rpm' \) -print | sort)
+          mapfile -t assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.deb' -o -name '*.rpm' -o -name '*.zip' \) -print | sort)
           if [ "${#assets[@]}" -eq 0 ]; then
             echo "No release assets found" >&2
             exit 1

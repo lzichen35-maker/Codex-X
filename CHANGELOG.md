@@ -2,6 +2,13 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [v0.2.16] - 2026-07-04
+
+- Release 新增 macOS Intel 构建，Intel Mac 用户可下载 x64 DMG。
+- macOS Release 现在同时提供 Apple Silicon 与 Intel 两种 DMG。
+- Windows Release 新增 portable ZIP，包含可直接运行的 `Codex-X.exe`，无需 MSI 安装。
+- 发布流程支持上传 `.zip` portable 产物，并更新 README 下载说明。
+
 ## [v0.2.15] - 2026-07-04
 
 - 会话管理页移除 CODEX_HOME 与 Provider Sync 备份位置展示，页面信息更简洁。
