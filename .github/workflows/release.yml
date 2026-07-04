@@ -16,7 +16,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest, ubuntu-22.04, windows-latest]
+        include:
+          - platform: macos-latest
+            args: --bundles dmg
+          - platform: ubuntu-22.04
+            args: --bundles deb,rpm
+          - platform: windows-latest
+            args: --bundles msi
 
     steps:
       - name: Checkout
@@ -62,9 +68,10 @@ jobs:
             Codex-X desktop release.
 
             - macOS: `.dmg`
-            - Windows: `.msi` / `.exe`
-            - Linux: `.AppImage` / `.deb` / `.rpm`
+            - Windows: `.msi`
+            - Linux: `.deb` / `.rpm`
 
             GitHub 会自动附带 Source code (zip/tar.gz)。
           releaseDraft: false
           prerelease: false
+          args: ${{ matrix.args }}
