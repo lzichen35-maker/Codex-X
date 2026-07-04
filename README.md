@@ -99,6 +99,41 @@ Codex-X 不是普通的配置文件编辑器，而是一个面向 Codex CLI 的 
 
 </details>
 
+## 功能特性
+
+<div align="center">
+<table>
+  <tr>
+    <th align="center" width="180">功能</th>
+    <th align="center">说明</th>
+  </tr>
+  <tr>
+    <td align="center">⚡ 供应商 API</td>
+    <td>可视化管理官方 OpenAI / 第三方 Codex Provider，支持 Base URL、API Key、Model、Wire API 与一键切换。</td>
+  </tr>
+  <tr>
+    <td align="center">🧩 <b>提示词注入</b></td>
+    <td><b>特色功能</b>：内置 <code>gpt5.4-unrestricted.md</code> / <code>gpt5.5-unrestricted.md</code>，一键写入 Codex 配置；启用后可达到上方效果图中的 SQL 注入测试、APK / EXE 逆向等响应效果。</td>
+  </tr>
+  <tr>
+    <td align="center">💬 会话管理</td>
+    <td>读取 Codex 本地 SQLite 与 rollout JSONL，会话列表可视化展示，并支持 Provider Sync / 修复历史 thread 元数据。</td>
+  </tr>
+  <tr>
+    <td align="center">📝 TOML 配置</td>
+    <td>查看当前 <code>~/.codex/config.toml</code>，并在 Provider 编辑页直接编辑完整 TOML，保存后同步到 Codex 配置目录。</td>
+  </tr>
+  <tr>
+    <td align="center">🔐 Auth 管理</td>
+    <td>读取 / 编辑官方 <code>~/.codex/auth.json</code>，区分 ChatGPT 登录态 Auth 与第三方 API Key。</td>
+  </tr>
+  <tr>
+    <td align="center">📦 跨平台发布</td>
+    <td>提供 macOS <code>.dmg</code>、Windows <code>.msi</code>、Linux <code>.deb</code> / <code>.rpm</code>，支持应用内检测更新。</td>
+  </tr>
+</table>
+</div>
+
 ## 核心亮点
 
 ### 1. 内置双指令提示词模板
