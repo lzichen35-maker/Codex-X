@@ -2,6 +2,12 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [v0.2.18] - 2026-07-05
+
+- 指令提示词内置模板支持从 GitHub `examples/` 实时检查更新，并缓存到本地；启用内置模板时优先使用 GitHub 最新版本，离线时自动回退本地缓存或打包内置版本。
+- 指令提示词页面新增“更新内置模板”状态与来源展示，可看到模板来自 GitHub 最新、本地缓存或打包内置。
+- 继续保留导入 `.md` 提示词、外部提示词自动记忆、会话管理交互优化和 API Key 可见切换等体验改进。
+
 ## [v0.2.17] - 2026-07-04
 
 - 修复 macOS Intel Release 构建 runner：从已不可用/长时间排队的 `macos-13` 切换为 `macos-15-intel`。
