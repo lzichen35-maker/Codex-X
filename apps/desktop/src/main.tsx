@@ -70,6 +70,17 @@ type SavedPrompt = {
   content: string;
 };
 
+type BuiltinPromptStatus = {
+  id: string;
+  filename: string;
+  sourceUrl: string;
+  cached: boolean;
+  updated: boolean;
+  contentSource: string;
+  checkedAt?: string | null;
+  message: string;
+};
+
 type BackupEntry = {
   id: string;
   action: string;
@@ -747,6 +758,7 @@ function App() {
   const [editingPromptId, setEditingPromptId] = React.useState<string | null>(null);
   const [savedProviders, setSavedProviders] = React.useState<SavedProvider[]>([]);
   const [savedPrompts, setSavedPrompts] = React.useState<SavedPrompt[]>([]);
+  const [builtinPromptStatus, setBuiltinPromptStatus] = React.useState<BuiltinPromptStatus[]>([]);
   const [aboutInfo, setAboutInfo] = React.useState<AboutInfo | null>(null);
   const [releaseInfo, setReleaseInfo] = React.useState<ReleaseInfo>({ status: "idle" });
   const [updatePromptOpen, setUpdatePromptOpen] = React.useState(false);
@@ -771,9 +783,11 @@ function App() {
   const [officialForm, setOfficialForm] = React.useState({ model: "gpt-5.5", authJson: "" });
   const autoUpdateCheckedRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
+  const promptUpdateCheckedRef = React.useRef(false);
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm, state), [providerForm, state]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile);
+  const builtinPromptStatusMap = React.useMemo(() => new Map(builtinPromptStatus.map((item) => [item.id, item])), [builtinPromptStatus]);
   const releaseStatusLabel = React.useMemo(() => {
     if (releaseInfo.status === "checking") return lang === "zh" ? "检查中" : "Checking";
     if (releaseInfo.status === "error") return lang === "zh" ? "失败" : "Failed";
@@ -895,22 +909,24 @@ function App() {
   const refresh = React.useCallback(() => {
     call(
       async () => {
-        const [diagnostics, next, backupList, providerList, promptList, about] = await Promise.all([
+        const [diagnostics, next, backupList, providerList, promptList, builtinStatus, about] = await Promise.all([
           invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: configDir || null }),
           invoke<CodexState>("get_codex_state", { configDir: configDir || null }),
           invoke<BackupEntry[]>("list_backups"),
           invoke<SavedProvider[]>("list_saved_providers"),
           invoke<SavedPrompt[]>("list_saved_prompts"),
+          invoke<BuiltinPromptStatus[]>("get_builtin_prompt_status"),
           invoke<AboutInfo>("get_about_info", { configDir: configDir || null }),
         ]);
-        return { diagnostics, next, backupList, providerList, promptList, about };
+        return { diagnostics, next, backupList, providerList, promptList, builtinStatus, about };
       },
-      ({ diagnostics, next, backupList, providerList, promptList, about }) => {
+      ({ diagnostics, next, backupList, providerList, promptList, builtinStatus, about }) => {
         setStartupDiagnostics(diagnostics);
         setState(next);
         setBackups(backupList);
         setSavedProviders(providerList);
         setSavedPrompts(promptList);
+        setBuiltinPromptStatus(builtinStatus);
         setAboutInfo(about);
         if (!configDir) setConfigDir(next.codexDir);
         void invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || next.codexDir || null, targetProvider: null })
@@ -1041,6 +1057,26 @@ function App() {
       setLoading(false);
       setActionBusy("");
       if (promptImportRef.current) promptImportRef.current.value = "";
+    }
+  };
+
+  const refreshBuiltinPrompts = async ({ quiet = false }: { quiet?: boolean } = {}) => {
+    setActionBusy("refreshPrompts");
+    if (!quiet) setLoading(true);
+    try {
+      const list = await invoke<BuiltinPromptStatus[]>("refresh_builtin_prompts");
+      setBuiltinPromptStatus(list);
+      const updated = list.filter((item) => item.updated).length;
+      if (!quiet) {
+        setToast(updated > 0
+          ? (lang === "zh" ? `已更新 ${updated} 个内置提示词模板` : `${updated} built-in prompt template(s) updated`)
+          : (lang === "zh" ? "内置提示词已是 GitHub 最新" : "Built-in prompts are up to date"));
+      }
+    } catch (e) {
+      if (!quiet) setError(String(e));
+    } finally {
+      if (!quiet) setLoading(false);
+      setActionBusy("");
     }
   };
 
@@ -1206,6 +1242,13 @@ function App() {
     autoUpdateCheckedRef.current = true;
     void checkForUpdates({ quiet: true });
   }, [state, aboutInfo, checkForUpdates]);
+
+  React.useEffect(() => {
+    if (tab !== "instruction" || promptUpdateCheckedRef.current) return;
+    promptUpdateCheckedRef.current = true;
+    void refreshBuiltinPrompts({ quiet: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
 
   const loadCcSwitchOfficialAuth = async (showToast = true) => {
     const candidate = await invoke<OfficialAuthCandidate | null>("read_ccswitch_official_auth", { dbPath: null });
@@ -1884,6 +1927,9 @@ function App() {
                           accept=".md,text/markdown,text/plain"
                           onChange={(e) => void importPromptMd(e.target.files?.[0])}
                         />
+                        <button className="ghost-btn add-provider-btn lively-btn" onClick={() => void refreshBuiltinPrompts()} disabled={loading || actionBusy === "refreshPrompts"}>
+                          {actionBusy === "refreshPrompts" ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />} {actionBusy === "refreshPrompts" ? (lang === "zh" ? "更新中..." : "Updating...") : (lang === "zh" ? "更新内置模板" : "Update built-ins")}
+                        </button>
                         <button className="secondary-btn add-provider-btn lively-btn" onClick={() => promptImportRef.current?.click()} disabled={loading}>
                           {actionBusy === "importPrompt" ? <Loader2 size={18} className="spin" /> : <Upload size={18} />} {actionBusy === "importPrompt" ? (lang === "zh" ? "导入中..." : "Importing...") : (lang === "zh" ? "导入 md" : "Import md")}
                         </button>
@@ -1894,6 +1940,12 @@ function App() {
                     <div className="instruction-row-list">
                       {instructionTemplates.map((item) => {
                         const isCurrent = currentInstructionId === item.id;
+                        const remoteStatus = builtinPromptStatusMap.get(item.id);
+                        const sourceLabel = remoteStatus?.contentSource === "github"
+                          ? (lang === "zh" ? "GitHub 最新" : "GitHub latest")
+                          : remoteStatus?.contentSource === "cache"
+                            ? (lang === "zh" ? "本地缓存" : "Local cache")
+                            : (lang === "zh" ? "打包内置" : "Bundled");
                         return (
                           <div className={cx("instruction-row", isCurrent && "selected")} key={item.id}>
                             <div className="instruction-icon"><Sparkles size={22} /></div>
@@ -1901,6 +1953,10 @@ function App() {
                               <strong>{item.title}</strong>
                               <p>{item.subtitle}</p>
                               <code>./{item.filename}</code>
+                              <div className="prompt-remote-meta" title={remoteStatus?.message || undefined}>
+                                <span className={cx("mini-tag", remoteStatus?.contentSource === "github" ? "ok" : undefined)}>{sourceLabel}</span>
+                                {remoteStatus?.checkedAt && <small>{new Date(remoteStatus.checkedAt).toLocaleString()}</small>}
+                              </div>
                             </div>
                             <div className="instruction-status-col">
                               {isCurrent ? <StatusPill active label={t.provider.current} /> : <span />}

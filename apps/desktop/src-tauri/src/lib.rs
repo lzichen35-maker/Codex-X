@@ -156,6 +156,19 @@ struct SavedPrompt {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BuiltinPromptStatus {
+    id: String,
+    filename: String,
+    source_url: String,
+    cached: bool,
+    updated: bool,
+    content_source: String,
+    checked_at: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ImportResult {
     imported: usize,
     skipped: usize,
@@ -346,7 +359,15 @@ fn open_db() -> Result<Connection> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_prompts_updated_at ON prompts(updated_at DESC);",
+        CREATE INDEX IF NOT EXISTS idx_prompts_updated_at ON prompts(updated_at DESC);
+        CREATE TABLE IF NOT EXISTS builtin_prompt_cache (
+            id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            content TEXT NOT NULL,
+            checked_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
     )
     .map_err(|e| CodexxError::Database(e.to_string()))?;
     Ok(conn)
@@ -507,6 +528,181 @@ fn delete_prompt_inner(id: &str) -> Result<()> {
     conn.execute("DELETE FROM prompts WHERE id = ?1", params![id])
         .map_err(|e| CodexxError::Database(e.to_string()))?;
     Ok(())
+}
+
+fn builtin_prompt_meta(
+    template_id: &str,
+) -> Result<(&'static str, &'static str, &'static str, &'static str)> {
+    match template_id.trim() {
+        "gpt5.4-unrestricted" => Ok((
+            "gpt5.4-unrestricted",
+            INSTRUCTION_54_FILENAME,
+            INSTRUCTION_54_RELATIVE,
+            INSTRUCTION_54_CONTENT,
+        )),
+        "gpt5.5-unrestricted" | "" => Ok((
+            "gpt5.5-unrestricted",
+            INSTRUCTION_FILENAME,
+            INSTRUCTION_RELATIVE,
+            INSTRUCTION_CONTENT,
+        )),
+        other => Err(CodexxError::Config(format!("未知指令提示词模板: {other}"))),
+    }
+}
+
+fn builtin_prompt_source_url(filename: &str) -> String {
+    format!("https://raw.githubusercontent.com/yynxxxxx/Codex-X/main/examples/{filename}")
+}
+
+fn cached_builtin_prompt(id: &str) -> Result<Option<(String, String)>> {
+    let conn = open_db()?;
+    let mut stmt = conn
+        .prepare("SELECT content, checked_at FROM builtin_prompt_cache WHERE id = ?1")
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    match stmt.query_row([id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(CodexxError::Database(e.to_string())),
+    }
+}
+
+fn save_builtin_prompt_cache(
+    id: &str,
+    filename: &str,
+    source_url: &str,
+    content: &str,
+) -> Result<()> {
+    let conn = open_db()?;
+    let now = now_rfc3339();
+    conn.execute(
+        "INSERT INTO builtin_prompt_cache (id, filename, source_url, content, checked_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+           filename = excluded.filename,
+           source_url = excluded.source_url,
+           content = excluded.content,
+           checked_at = excluded.checked_at,
+           updated_at = CASE WHEN builtin_prompt_cache.content <> excluded.content THEN excluded.updated_at ELSE builtin_prompt_cache.updated_at END",
+        params![id, filename, source_url, content, now],
+    )
+    .map_err(|e| CodexxError::Database(e.to_string()))?;
+    Ok(())
+}
+
+fn fetch_remote_prompt(source_url: &str) -> Result<String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(12))
+        .build();
+    let response = agent
+        .get(source_url)
+        .set("User-Agent", "Codex-X")
+        .call()
+        .map_err(|e| CodexxError::Config(format!("GitHub 提示词更新失败: {e}")))?;
+    let text = response
+        .into_string()
+        .map_err(|e| CodexxError::Config(format!("读取 GitHub 提示词失败: {e}")))?;
+    if text.trim().is_empty() {
+        return Err(CodexxError::Config("GitHub 提示词内容为空".to_string()));
+    }
+    Ok(text)
+}
+
+fn refresh_builtin_prompt_inner(template_id: &str) -> Result<BuiltinPromptStatus> {
+    let (id, filename, _relative, bundled) = builtin_prompt_meta(template_id)?;
+    let source_url = builtin_prompt_source_url(filename);
+    let cached_before = cached_builtin_prompt(id)?;
+    match fetch_remote_prompt(&source_url) {
+        Ok(remote) => {
+            let updated = cached_before
+                .as_ref()
+                .map(|(content, _)| content != &remote)
+                .unwrap_or(remote != bundled);
+            save_builtin_prompt_cache(id, filename, &source_url, &remote)?;
+            let checked_at = cached_builtin_prompt(id)?.map(|(_, checked_at)| checked_at);
+            Ok(BuiltinPromptStatus {
+                id: id.to_string(),
+                filename: filename.to_string(),
+                source_url,
+                cached: true,
+                updated,
+                content_source: "github".to_string(),
+                checked_at,
+                message: if updated {
+                    "已更新到 GitHub 最新提示词"
+                } else {
+                    "已是 GitHub 最新提示词"
+                }
+                .to_string(),
+            })
+        }
+        Err(e) => {
+            let cached = cached_before.is_some();
+            Ok(BuiltinPromptStatus {
+                id: id.to_string(),
+                filename: filename.to_string(),
+                source_url,
+                cached,
+                updated: false,
+                content_source: if cached { "cache" } else { "bundled" }.to_string(),
+                checked_at: cached_before.map(|(_, checked_at)| checked_at),
+                message: format!(
+                    "无法连接 GitHub，已使用{}：{}",
+                    if cached {
+                        "本地缓存"
+                    } else {
+                        "打包内置版本"
+                    },
+                    e
+                ),
+            })
+        }
+    }
+}
+
+fn builtin_prompt_status_inner() -> Result<Vec<BuiltinPromptStatus>> {
+    ["gpt5.5-unrestricted", "gpt5.4-unrestricted"]
+        .iter()
+        .map(|template_id| {
+            let (id, filename, _relative, _bundled) = builtin_prompt_meta(template_id)?;
+            let source_url = builtin_prompt_source_url(filename);
+            let cached = cached_builtin_prompt(id)?;
+            Ok(BuiltinPromptStatus {
+                id: id.to_string(),
+                filename: filename.to_string(),
+                source_url,
+                cached: cached.is_some(),
+                updated: false,
+                content_source: if cached.is_some() { "cache" } else { "bundled" }.to_string(),
+                checked_at: cached.map(|(_, checked_at)| checked_at),
+                message: "未检查 GitHub 更新".to_string(),
+            })
+        })
+        .collect()
+}
+
+fn refresh_builtin_prompts_inner() -> Result<Vec<BuiltinPromptStatus>> {
+    ["gpt5.5-unrestricted", "gpt5.4-unrestricted"]
+        .iter()
+        .map(|template_id| refresh_builtin_prompt_inner(template_id))
+        .collect()
+}
+
+fn builtin_prompt_content(
+    template_id: &str,
+) -> Result<(&'static str, &'static str, String, String)> {
+    let (id, filename, relative, bundled) = builtin_prompt_meta(template_id)?;
+    let _ = refresh_builtin_prompt_inner(id);
+    if let Some((content, _checked_at)) = cached_builtin_prompt(id)? {
+        return Ok((filename, relative, content, "github/cache".to_string()));
+    }
+    Ok((
+        filename,
+        relative,
+        bundled.to_string(),
+        "bundled".to_string(),
+    ))
 }
 
 fn resolve_instruction_path(codex_dir: &Path, value: &str) -> PathBuf {
@@ -2080,22 +2276,6 @@ fn sync_sessions_provider_inner(
     result
 }
 
-fn instruction_template(template_id: &str) -> Result<(&'static str, &'static str, &'static str)> {
-    match template_id.trim() {
-        "gpt5.4-unrestricted" => Ok((
-            INSTRUCTION_54_FILENAME,
-            INSTRUCTION_54_RELATIVE,
-            INSTRUCTION_54_CONTENT,
-        )),
-        "gpt5.5-unrestricted" | "" => Ok((
-            INSTRUCTION_FILENAME,
-            INSTRUCTION_RELATIVE,
-            INSTRUCTION_CONTENT,
-        )),
-        other => Err(CodexxError::Config(format!("未知指令提示词模板: {other}"))),
-    }
-}
-
 fn is_managed_instruction_value(value: &str) -> bool {
     [INSTRUCTION_FILENAME, INSTRUCTION_54_FILENAME]
         .iter()
@@ -2177,6 +2357,16 @@ fn get_about_info(config_dir: Option<String>) -> Result<AboutInfo> {
 #[tauri::command]
 fn list_saved_prompts() -> Result<Vec<SavedPrompt>> {
     list_saved_prompts_inner()
+}
+
+#[tauri::command]
+fn get_builtin_prompt_status() -> Result<Vec<BuiltinPromptStatus>> {
+    builtin_prompt_status_inner()
+}
+
+#[tauri::command]
+fn refresh_builtin_prompts() -> Result<Vec<BuiltinPromptStatus>> {
+    refresh_builtin_prompts_inner()
 }
 
 #[tauri::command]
@@ -2375,7 +2565,7 @@ fn save_official_config(input: OfficialConfigInput) -> Result<ActionResult> {
 }
 
 fn enable_instruction_inner(config_dir: Option<String>, template_id: &str) -> Result<ActionResult> {
-    let (filename, relative, content) = instruction_template(template_id)?;
+    let (filename, relative, content, content_source) = builtin_prompt_content(template_id)?;
     let codex_dir = resolve_codex_dir(config_dir)?;
     let _ = remember_current_instruction_prompt(&codex_dir);
     fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
@@ -2389,13 +2579,13 @@ fn enable_instruction_inner(config_dir: Option<String>, template_id: &str) -> Re
     }
     doc["model_instructions_file"] = value(relative);
 
-    write_text(&codex_dir.join(filename), content)?;
+    write_text(&codex_dir.join(filename), &content)?;
     write_text(&cfg, &doc.to_string())?;
 
     let state = build_state(codex_dir)?;
     Ok(ActionResult {
         ok: true,
-        message: format!("已启用 {filename}"),
+        message: format!("已启用 {filename}（来源：{content_source}）"),
         backup_id,
         state,
     })
@@ -2651,6 +2841,8 @@ pub fn run() {
             read_ccswitch_official_auth,
             import_ccswitch_codex_providers,
             list_saved_prompts,
+            get_builtin_prompt_status,
+            refresh_builtin_prompts,
             remember_current_instruction,
             save_prompt,
             delete_saved_prompt,
