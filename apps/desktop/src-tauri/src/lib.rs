@@ -446,6 +446,30 @@ fn open_db() -> Result<Connection> {
         [],
     )
     .map_err(|e| CodexxError::Database(e.to_string()))?;
+    conn.execute(
+        "DELETE FROM prompts
+         WHERE id LIKE 'external-%'
+           AND EXISTS (
+             SELECT 1 FROM prompts AS kept
+             WHERE kept.content = prompts.content
+               AND kept.id NOT LIKE 'external-%'
+           )",
+        [],
+    )
+    .map_err(|e| CodexxError::Database(e.to_string()))?;
+    conn.execute(
+        "DELETE FROM prompts
+         WHERE id LIKE 'external-%'
+           AND EXISTS (
+             SELECT 1 FROM prompts AS kept
+             WHERE kept.content = prompts.content
+               AND kept.id LIKE 'external-%'
+               AND kept.rowid <> prompts.rowid
+               AND (kept.updated_at > prompts.updated_at OR (kept.updated_at = prompts.updated_at AND kept.rowid > prompts.rowid))
+           )",
+        [],
+    )
+    .map_err(|e| CodexxError::Database(e.to_string()))?;
     Ok(conn)
 }
 
@@ -562,11 +586,13 @@ fn list_saved_prompts_inner() -> Result<Vec<SavedPrompt>> {
     let mut prompts = Vec::new();
     for row in rows {
         let prompt = row.map_err(|e| CodexxError::Database(e.to_string()))?;
-        let key = prompt.filename.to_ascii_lowercase();
-        if let Some(index) = prompts
-            .iter()
-            .position(|existing: &SavedPrompt| existing.filename.to_ascii_lowercase() == key)
-        {
+        let filename_key = prompt.filename.to_ascii_lowercase();
+        let duplicate_index = prompts.iter().position(|existing: &SavedPrompt| {
+            existing.filename.to_ascii_lowercase() == filename_key
+                || (existing.content == prompt.content
+                    && (existing.id.starts_with("external-") || prompt.id.starts_with("external-")))
+        });
+        if let Some(index) = duplicate_index {
             let existing_is_external = prompts[index].id.starts_with("external-");
             let prompt_is_external = prompt.id.starts_with("external-");
             if existing_is_external && !prompt_is_external {
@@ -630,6 +656,30 @@ fn find_saved_prompt_by_filename(filename: &str) -> Result<Option<SavedPrompt>> 
         )
         .map_err(|e| CodexxError::Database(e.to_string()))?;
     match stmt.query_row([filename], |row| {
+        Ok(SavedPrompt {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            filename: row.get(2)?,
+            content: row.get(3)?,
+        })
+    }) {
+        Ok(prompt) => Ok(Some(prompt)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(CodexxError::Database(e.to_string())),
+    }
+}
+
+fn find_saved_prompt_by_content(content: &str) -> Result<Option<SavedPrompt>> {
+    let conn = open_db()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, filename, content FROM prompts
+             WHERE content = ?1
+             ORDER BY CASE WHEN id LIKE 'external-%' THEN 1 ELSE 0 END, updated_at DESC, created_at DESC
+             LIMIT 1",
+        )
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    match stmt.query_row([content], |row| {
         Ok(SavedPrompt {
             id: row.get(0)?,
             title: row.get(1)?,
@@ -867,24 +917,28 @@ fn remember_current_instruction_prompt(codex_dir: &Path) -> Result<Option<SavedP
         .and_then(|v| v.to_str())
         .unwrap_or("external-prompt");
     let normalized_filename = normalize_prompt_filename(&file_name, "external-prompt");
-    let existing = find_saved_prompt_by_filename(&normalized_filename)?;
-    let (id, title) = existing
-        .map(|prompt| (prompt.id, prompt.title))
+    let existing = find_saved_prompt_by_content(&content)?.or_else(|| {
+        find_saved_prompt_by_filename(&normalized_filename)
+            .ok()
+            .flatten()
+    });
+    let (id, title, filename) = existing
+        .map(|prompt| (prompt.id, prompt.title, prompt.filename))
         .unwrap_or_else(|| {
             (
                 format!("external-{}", sanitize_id(stem)),
                 format!("外部提示词 · {stem}"),
+                normalized_filename,
             )
         });
     save_prompt_inner(SavedPrompt {
         id,
         title,
-        filename: normalized_filename,
+        filename,
         content,
     })
     .map(Some)
 }
-
 
 fn codex_skills_dir(codex_dir: &Path) -> PathBuf {
     codex_dir.join("skills")
@@ -909,7 +963,11 @@ fn sanitize_dir_name(input: &str, fallback: &str) -> String {
         }
     }
     let out = out.trim_matches('-');
-    if out.is_empty() { fallback.to_string() } else { out.to_string() }
+    if out.is_empty() {
+        fallback.to_string()
+    } else {
+        out.to_string()
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -942,11 +1000,18 @@ fn compute_dir_hash(dir: &Path) -> Result<String> {
             let entry = entry.map_err(|e| io_err(current, e))?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') { continue; }
+            if name.starts_with('.') {
+                continue;
+            }
             let meta = fs::symlink_metadata(&path).map_err(|e| io_err(&path, e))?;
-            if meta.file_type().is_symlink() { continue; }
-            if meta.is_dir() { collect(base, &path, out)?; }
-            else if meta.is_file() { out.push(path); }
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                collect(base, &path, out)?;
+            } else if meta.is_file() {
+                out.push(path);
+            }
         }
         let _ = base;
         Ok(())
@@ -956,7 +1021,11 @@ fn compute_dir_hash(dir: &Path) -> Result<String> {
     files.sort();
     let mut hasher = Sha256::new();
     for path in files {
-        let rel = path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
         hasher.update(rel.as_bytes());
         hasher.update(b"\0");
         let bytes = fs::read(&path).map_err(|e| io_err(&path, e))?;
@@ -973,7 +1042,9 @@ fn read_skill_metadata(skill_dir: &Path, fallback: &str) -> (String, Option<Stri
     let mut desc = None;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
         if title.is_none() && trimmed.starts_with('#') {
             title = Some(trimmed.trim_start_matches('#').trim().to_string());
             continue;
@@ -983,7 +1054,12 @@ fn read_skill_metadata(skill_dir: &Path, fallback: &str) -> (String, Option<Stri
             break;
         }
     }
-    (title.filter(|s| !s.is_empty()).unwrap_or_else(|| fallback.to_string()), desc.filter(|s| !s.is_empty()))
+    (
+        title
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| fallback.to_string()),
+        desc.filter(|s| !s.is_empty()),
+    )
 }
 
 fn save_managed_skill(skill: &ManagedSkill) -> Result<()> {
@@ -1013,21 +1089,39 @@ fn save_managed_skill(skill: &ManagedSkill) -> Result<()> {
     Ok(())
 }
 
-fn scan_skill_dir(base: &Path, enabled: bool, source: &str, out: &mut Vec<ManagedSkill>, seen: &mut HashSet<String>) -> Result<()> {
-    if !base.exists() { return Ok(()); }
+fn scan_skill_dir(
+    base: &Path,
+    enabled: bool,
+    source: &str,
+    out: &mut Vec<ManagedSkill>,
+    seen: &mut HashSet<String>,
+) -> Result<()> {
+    if !base.exists() {
+        return Ok(());
+    }
     for entry in fs::read_dir(base).map_err(|e| io_err(base, e))? {
         let entry = entry.map_err(|e| io_err(base, e))?;
         let path = entry.path();
-        if !path.is_dir() || !path.join("SKILL.md").is_file() { continue; }
+        if !path.is_dir() || !path.join("SKILL.md").is_file() {
+            continue;
+        }
         let directory = entry.file_name().to_string_lossy().to_string();
         let id = sanitize_dir_name(&directory, "skill");
-        if seen.contains(&id) { continue; }
+        if seen.contains(&id) {
+            continue;
+        }
         let (name, description) = read_skill_metadata(&path, &directory);
         let hash = compute_dir_hash(&path).ok();
         out.push(ManagedSkill {
-            id: id.clone(), name, description, directory, enabled,
-            source: source.to_string(), path: path.display().to_string(),
-            content_hash: hash, update_status: "未检查".to_string(),
+            id: id.clone(),
+            name,
+            description,
+            directory,
+            enabled,
+            source: source.to_string(),
+            path: path.display().to_string(),
+            content_hash: hash,
+            update_status: "未检查".to_string(),
         });
         seen.insert(id);
     }
@@ -1035,10 +1129,18 @@ fn scan_skill_dir(base: &Path, enabled: bool, source: &str, out: &mut Vec<Manage
 }
 
 fn toml_value_to_json(value: &toml_edit::Value) -> Value {
-    if let Some(s) = value.as_str() { return json!(s); }
-    if let Some(i) = value.as_integer() { return json!(i); }
-    if let Some(f) = value.as_float() { return json!(f); }
-    if let Some(b) = value.as_bool() { return json!(b); }
+    if let Some(s) = value.as_str() {
+        return json!(s);
+    }
+    if let Some(i) = value.as_integer() {
+        return json!(i);
+    }
+    if let Some(f) = value.as_float() {
+        return json!(f);
+    }
+    if let Some(b) = value.as_bool() {
+        return json!(b);
+    }
     if let Some(arr) = value.as_array() {
         return Value::Array(arr.iter().map(toml_value_to_json).collect());
     }
@@ -1046,7 +1148,9 @@ fn toml_value_to_json(value: &toml_edit::Value) -> Value {
 }
 
 fn toml_item_to_json(item: &Item) -> Value {
-    if let Some(v) = item.as_value() { return toml_value_to_json(v); }
+    if let Some(v) = item.as_value() {
+        return toml_value_to_json(v);
+    }
     if let Some(tbl) = item.as_table() {
         let mut obj = serde_json::Map::new();
         for (k, v) in tbl.iter() {
@@ -1062,19 +1166,30 @@ fn json_to_toml_item(value_json: &Value) -> Item {
         Value::String(s) => value(s.clone()),
         Value::Bool(b) => value(*b),
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() { value(i) }
-            else if let Some(f) = n.as_f64() { value(f) }
-            else { value(n.to_string()) }
+            if let Some(i) = n.as_i64() {
+                value(i)
+            } else if let Some(f) = n.as_f64() {
+                value(f)
+            } else {
+                value(n.to_string())
+            }
         }
         Value::Array(arr) => {
             let mut toml_arr = toml_edit::Array::default();
             for item in arr {
                 match item {
-                    Value::String(s) => { toml_arr.push(s.as_str()); }
-                    Value::Bool(b) => { toml_arr.push(*b); }
+                    Value::String(s) => {
+                        toml_arr.push(s.as_str());
+                    }
+                    Value::Bool(b) => {
+                        toml_arr.push(*b);
+                    }
                     Value::Number(n) => {
-                        if let Some(i) = n.as_i64() { toml_arr.push(i); }
-                        else if let Some(f) = n.as_f64() { toml_arr.push(f); }
+                        if let Some(i) = n.as_i64() {
+                            toml_arr.push(i);
+                        } else if let Some(f) = n.as_f64() {
+                            toml_arr.push(f);
+                        }
                     }
                     _ => {}
                 }
@@ -1093,17 +1208,46 @@ fn json_to_toml_item(value_json: &Value) -> Item {
 }
 
 fn mcp_summary(config: &Value) -> (String, Option<String>, Option<String>, String) {
-    let transport = config.get("type").and_then(Value::as_str).unwrap_or_else(|| {
-        if config.get("url").is_some() { "http" } else { "stdio" }
-    }).to_string();
-    let command = config.get("command").and_then(Value::as_str).map(ToString::to_string);
-    let url = config.get("url").and_then(Value::as_str).map(ToString::to_string);
-    let args = config.get("args").and_then(Value::as_array).map(|arr| {
-        arr.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")
-    }).unwrap_or_default();
+    let transport = config
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if config.get("url").is_some() {
+                "http"
+            } else {
+                "stdio"
+            }
+        })
+        .to_string();
+    let command = config
+        .get("command")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let url = config
+        .get("url")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let args = config
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
     let summary = if let Some(cmd) = &command {
-        if args.is_empty() { cmd.clone() } else { format!("{cmd} {args}") }
-    } else if let Some(url) = &url { url.clone() } else { transport.clone() };
+        if args.is_empty() {
+            cmd.clone()
+        } else {
+            format!("{cmd} {args}")
+        }
+    } else if let Some(url) = &url {
+        url.clone()
+    } else {
+        transport.clone()
+    };
     (transport, command, url, summary)
 }
 
@@ -1117,8 +1261,15 @@ fn save_managed_mcp(id: &str, name: &str, config: &Value, enabled: bool) -> Resu
            server_config = excluded.server_config,
            enabled = excluded.enabled,
            updated_at = excluded.updated_at",
-        params![id, name, serde_json::to_string(config).unwrap_or_default(), enabled, now_rfc3339()],
-    ).map_err(|e| CodexxError::Database(e.to_string()))?;
+        params![
+            id,
+            name,
+            serde_json::to_string(config).unwrap_or_default(),
+            enabled,
+            now_rfc3339()
+        ],
+    )
+    .map_err(|e| CodexxError::Database(e.to_string()))?;
     Ok(())
 }
 
@@ -1126,31 +1277,55 @@ fn db_managed_mcp() -> Result<Vec<(String, String, Value, bool)>> {
     let conn = open_db()?;
     let mut stmt = conn.prepare("SELECT id, name, server_config, enabled FROM managed_mcp_servers ORDER BY name ASC, id ASC")
         .map_err(|e| CodexxError::Database(e.to_string()))?;
-    let rows = stmt.query_map([], |row| {
-        let text: String = row.get(2)?;
-        let config = serde_json::from_str(&text).unwrap_or(Value::Object(Default::default()));
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, config, row.get::<_, bool>(3)?))
-    }).map_err(|e| CodexxError::Database(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let text: String = row.get(2)?;
+            let config = serde_json::from_str(&text).unwrap_or(Value::Object(Default::default()));
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                config,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
     let mut out = Vec::new();
-    for row in rows { out.push(row.map_err(|e| CodexxError::Database(e.to_string()))?); }
+    for row in rows {
+        out.push(row.map_err(|e| CodexxError::Database(e.to_string()))?);
+    }
     Ok(out)
 }
 
 fn list_mcp_from_config(codex_dir: &Path) -> Result<Vec<ManagedMcpServer>> {
     let cfg = config_path(codex_dir);
     let text = read_to_string_if_exists(&cfg)?;
-    if text.trim().is_empty() { return Ok(vec![]); }
+    if text.trim().is_empty() {
+        return Ok(vec![]);
+    }
     let doc = parse_toml_document(&cfg, &text)?;
-    let Some(mcp_item) = doc.get("mcp_servers") else { return Ok(vec![]); };
-    let Some(mcp_tbl) = mcp_item.as_table() else { return Ok(vec![]); };
+    let Some(mcp_item) = doc.get("mcp_servers") else {
+        return Ok(vec![]);
+    };
+    let Some(mcp_tbl) = mcp_item.as_table() else {
+        return Ok(vec![]);
+    };
     let mut out = Vec::new();
     for (id, item) in mcp_tbl.iter() {
-        if !item.is_table() { continue; }
+        if !item.is_table() {
+            continue;
+        }
         let config = toml_item_to_json(item);
         let (transport, command, url, summary) = mcp_summary(&config);
         out.push(ManagedMcpServer {
-            id: id.to_string(), name: id.to_string(), transport, enabled: true,
-            source: "config.toml".to_string(), summary, command, url, config_json: config,
+            id: id.to_string(),
+            name: id.to_string(),
+            transport,
+            enabled: true,
+            source: "config.toml".to_string(),
+            summary,
+            command,
+            url,
+            config_json: config,
         });
     }
     Ok(out)
@@ -1163,15 +1338,37 @@ fn build_skills_mcp_state_inner(config_dir: Option<String>) -> Result<SkillsMcpS
     let mut warnings = Vec::new();
     let mut skills = Vec::new();
     let mut seen = HashSet::new();
-    if let Err(e) = scan_skill_dir(&skills_dir, true, "Codex", &mut skills, &mut seen) { warnings.push(e.to_string()); }
-    if let Err(e) = scan_skill_dir(&disabled_dir, false, "Codex-X 已禁用", &mut skills, &mut seen) { warnings.push(e.to_string()); }
+    if let Err(e) = scan_skill_dir(&skills_dir, true, "Codex", &mut skills, &mut seen) {
+        warnings.push(e.to_string());
+    }
+    if let Err(e) = scan_skill_dir(
+        &disabled_dir,
+        false,
+        "Codex-X 已禁用",
+        &mut skills,
+        &mut seen,
+    ) {
+        warnings.push(e.to_string());
+    }
 
     let mut mcp_servers = list_mcp_from_config(&codex_dir)?;
     let enabled_ids: HashSet<String> = mcp_servers.iter().map(|s| s.id.clone()).collect();
     for (id, name, config, enabled) in db_managed_mcp()? {
-        if enabled_ids.contains(&id) { continue; }
+        if enabled_ids.contains(&id) {
+            continue;
+        }
         let (transport, command, url, summary) = mcp_summary(&config);
-        mcp_servers.push(ManagedMcpServer { id, name, transport, enabled, source: "Codex-X".to_string(), summary, command, url, config_json: config });
+        mcp_servers.push(ManagedMcpServer {
+            id,
+            name,
+            transport,
+            enabled,
+            source: "Codex-X".to_string(),
+            summary,
+            command,
+            url,
+            config_json: config,
+        });
     }
     mcp_servers.sort_by(|a, b| b.enabled.cmp(&a.enabled).then_with(|| a.name.cmp(&b.name)));
     skills.sort_by(|a, b| b.enabled.cmp(&a.enabled).then_with(|| a.name.cmp(&b.name)));
@@ -1179,7 +1376,9 @@ fn build_skills_mcp_state_inner(config_dir: Option<String>) -> Result<SkillsMcpS
         codex_dir: codex_dir.display().to_string(),
         codex_skills_dir: skills_dir.display().to_string(),
         disabled_skills_dir: disabled_dir.display().to_string(),
-        skills, mcp_servers, warnings,
+        skills,
+        mcp_servers,
+        warnings,
     })
 }
 
@@ -1193,11 +1392,15 @@ fn import_existing_skills_mcp_inner(config_dir: Option<String>) -> Result<Skills
         home_dir()?.join(".cc-switch").join("skills"),
     ];
     for base in candidates {
-        if !base.exists() { continue; }
+        if !base.exists() {
+            continue;
+        }
         for entry in fs::read_dir(&base).map_err(|e| io_err(&base, e))? {
             let entry = entry.map_err(|e| io_err(&base, e))?;
             let src = entry.path();
-            if !src.is_dir() || !src.join("SKILL.md").is_file() { continue; }
+            if !src.is_dir() || !src.join("SKILL.md").is_file() {
+                continue;
+            }
             let directory = sanitize_dir_name(&entry.file_name().to_string_lossy(), "skill");
             let dst = skills_dir.join(&directory);
             if !dst.exists() {
@@ -1214,25 +1417,36 @@ fn import_existing_skills_mcp_inner(config_dir: Option<String>) -> Result<Skills
     }
     let state = build_skills_mcp_state_inner(config_dir)?;
     Ok(SkillsMcpActionResult {
-        imported_skills, imported_mcp,
+        imported_skills,
+        imported_mcp,
         message: format!("已导入 {imported_skills} 个 Skills，纳管 {imported_mcp} 个 MCP"),
         state,
     })
 }
 
-fn toggle_codex_mcp_inner(config_dir: Option<String>, id: String, enabled: bool) -> Result<SkillsMcpState> {
+fn toggle_codex_mcp_inner(
+    config_dir: Option<String>,
+    id: String,
+    enabled: bool,
+) -> Result<SkillsMcpState> {
     let codex_dir = resolve_codex_dir(config_dir.clone())?;
     fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
     let cfg = config_path(&codex_dir);
     let text = read_to_string_if_exists(&cfg)?;
     let mut doc = parse_toml_document(&cfg, &text)?;
     if enabled {
-        let db = db_managed_mcp()?.into_iter().find(|(sid, _, _, _)| sid == &id)
+        let db = db_managed_mcp()?
+            .into_iter()
+            .find(|(sid, _, _, _)| sid == &id)
             .ok_or_else(|| CodexxError::Config(format!("未找到 MCP: {id}")))?;
         doc["mcp_servers"][&id] = json_to_toml_item(&db.2);
         save_managed_mcp(&id, &db.1, &db.2, true)?;
     } else {
-        if let Some(item) = doc.get("mcp_servers").and_then(|m| m.as_table()).and_then(|tbl| tbl.get(&id)) {
+        if let Some(item) = doc
+            .get("mcp_servers")
+            .and_then(|m| m.as_table())
+            .and_then(|tbl| tbl.get(&id))
+        {
             let config = toml_item_to_json(item);
             save_managed_mcp(&id, &id, &config, false)?;
         }
@@ -1244,7 +1458,11 @@ fn toggle_codex_mcp_inner(config_dir: Option<String>, id: String, enabled: bool)
     build_skills_mcp_state_inner(config_dir)
 }
 
-fn toggle_codex_skill_inner(config_dir: Option<String>, id: String, enabled: bool) -> Result<SkillsMcpState> {
+fn toggle_codex_skill_inner(
+    config_dir: Option<String>,
+    id: String,
+    enabled: bool,
+) -> Result<SkillsMcpState> {
     let codex_dir = resolve_codex_dir(config_dir.clone())?;
     let skills_dir = codex_skills_dir(&codex_dir);
     let disabled_dir = disabled_skills_dir()?;
@@ -1261,70 +1479,115 @@ fn toggle_codex_skill_inner(config_dir: Option<String>, id: String, enabled: boo
     let disabled_path = disabled_dir.join(&name);
     if enabled {
         if disabled_path.exists() && !enabled_path.exists() {
-            fs::rename(&disabled_path, &enabled_path).or_else(|_| { copy_dir_recursive(&disabled_path, &enabled_path).map(|_| { let _ = fs::remove_dir_all(&disabled_path); }) })
+            fs::rename(&disabled_path, &enabled_path)
+                .or_else(|_| {
+                    copy_dir_recursive(&disabled_path, &enabled_path).map(|_| {
+                        let _ = fs::remove_dir_all(&disabled_path);
+                    })
+                })
                 .map_err(|e| CodexxError::Config(format!("启用 Skill 失败: {e}")))?;
         }
     } else if enabled_path.exists() && !disabled_path.exists() {
-        fs::rename(&enabled_path, &disabled_path).or_else(|_| { copy_dir_recursive(&enabled_path, &disabled_path).map(|_| { let _ = fs::remove_dir_all(&enabled_path); }) })
+        fs::rename(&enabled_path, &disabled_path)
+            .or_else(|_| {
+                copy_dir_recursive(&enabled_path, &disabled_path).map(|_| {
+                    let _ = fs::remove_dir_all(&enabled_path);
+                })
+            })
             .map_err(|e| CodexxError::Config(format!("禁用 Skill 失败: {e}")))?;
     }
     build_skills_mcp_state_inner(config_dir)
 }
 
-fn install_skill_zip_inner(config_dir: Option<String>, file_name: String, bytes: Vec<u8>) -> Result<SkillsMcpActionResult> {
+fn install_skill_zip_inner(
+    config_dir: Option<String>,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> Result<SkillsMcpActionResult> {
     let codex_dir = resolve_codex_dir(config_dir.clone())?;
     let skills_dir = codex_skills_dir(&codex_dir);
     fs::create_dir_all(&skills_dir).map_err(|e| io_err(&skills_dir, e))?;
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| CodexxError::Config(format!("读取 ZIP 失败: {e}")))?;
-    let tmp = app_home()?.join("tmp").join(format!("skill-zip-{}", Local::now().timestamp_millis()));
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| CodexxError::Config(format!("读取 ZIP 失败: {e}")))?;
+    let tmp = app_home()?
+        .join("tmp")
+        .join(format!("skill-zip-{}", Local::now().timestamp_millis()));
     fs::create_dir_all(&tmp).map_err(|e| io_err(&tmp, e))?;
     let mut total_size = 0u64;
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| CodexxError::Config(format!("读取 ZIP 条目失败: {e}")))?;
-        let Some(path) = file.enclosed_name().map(|p| p.to_path_buf()) else { continue; };
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| CodexxError::Config(format!("读取 ZIP 条目失败: {e}")))?;
+        let Some(path) = file.enclosed_name().map(|p| p.to_path_buf()) else {
+            continue;
+        };
         total_size += file.size();
-        if total_size > 80 * 1024 * 1024 { return Err(CodexxError::Config("ZIP 解压后超过 80MB".to_string())); }
+        if total_size > 80 * 1024 * 1024 {
+            return Err(CodexxError::Config("ZIP 解压后超过 80MB".to_string()));
+        }
         let out = tmp.join(path);
         if file.name().ends_with('/') {
             fs::create_dir_all(&out).map_err(|e| io_err(&out, e))?;
         } else {
-            if let Some(parent) = out.parent() { fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?; }
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+            }
             let mut outfile = fs::File::create(&out).map_err(|e| io_err(&out, e))?;
             std::io::copy(&mut file, &mut outfile).map_err(|e| io_err(&out, e))?;
         }
     }
     let mut skill_dirs = Vec::new();
     fn find_skill_dirs(current: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-        if current.join("SKILL.md").is_file() { out.push(current.to_path_buf()); return Ok(()); }
+        if current.join("SKILL.md").is_file() {
+            out.push(current.to_path_buf());
+            return Ok(());
+        }
         for entry in fs::read_dir(current).map_err(|e| io_err(current, e))? {
             let entry = entry.map_err(|e| io_err(current, e))?;
             let path = entry.path();
-            if path.is_dir() { find_skill_dirs(&path, out)?; }
+            if path.is_dir() {
+                find_skill_dirs(&path, out)?;
+            }
         }
         Ok(())
     }
     find_skill_dirs(&tmp, &mut skill_dirs)?;
-    if skill_dirs.is_empty() { return Err(CodexxError::Config("ZIP 中没有找到 SKILL.md".to_string())); }
+    if skill_dirs.is_empty() {
+        return Err(CodexxError::Config("ZIP 中没有找到 SKILL.md".to_string()));
+    }
     let mut imported_skills = 0usize;
     for src in skill_dirs {
         let fallback = file_name.trim_end_matches(".zip");
         let dir_name = src.file_name().and_then(|v| v.to_str()).unwrap_or(fallback);
         let dst_name = sanitize_dir_name(dir_name, "skill");
         let dst = skills_dir.join(dst_name);
-        if dst.exists() { fs::remove_dir_all(&dst).map_err(|e| io_err(&dst, e))?; }
+        if dst.exists() {
+            fs::remove_dir_all(&dst).map_err(|e| io_err(&dst, e))?;
+        }
         copy_dir_recursive(&src, &dst)?;
         imported_skills += 1;
     }
     let _ = fs::remove_dir_all(&tmp);
     let state = build_skills_mcp_state_inner(config_dir)?;
-    Ok(SkillsMcpActionResult { imported_skills, imported_mcp: 0, message: format!("已从 ZIP 安装 {imported_skills} 个 Skill"), state })
+    Ok(SkillsMcpActionResult {
+        imported_skills,
+        imported_mcp: 0,
+        message: format!("已从 ZIP 安装 {imported_skills} 个 Skill"),
+        state,
+    })
 }
 
 fn check_skill_updates_inner(config_dir: Option<String>) -> Result<SkillsMcpState> {
     let mut next = build_skills_mcp_state_inner(config_dir)?;
     let conn = open_db()?;
     for skill in &mut next.skills {
-        let old: Option<String> = conn.query_row("SELECT content_hash FROM managed_skills WHERE id = ?1", [&skill.id], |row| row.get(0)).ok();
+        let old: Option<String> = conn
+            .query_row(
+                "SELECT content_hash FROM managed_skills WHERE id = ?1",
+                [&skill.id],
+                |row| row.get(0),
+            )
+            .ok();
         skill.update_status = match (&old, &skill.content_hash) {
             (Some(a), Some(b)) if a != b => "本地有变化".to_string(),
             (Some(_), Some(_)) => "已是最新".to_string(),
@@ -2892,24 +3155,38 @@ async fn import_existing_skills_mcp(config_dir: Option<String>) -> Result<Skills
 }
 
 #[tauri::command]
-async fn toggle_codex_skill(config_dir: Option<String>, id: String, enabled: bool) -> Result<SkillsMcpState> {
+async fn toggle_codex_skill(
+    config_dir: Option<String>,
+    id: String,
+    enabled: bool,
+) -> Result<SkillsMcpState> {
     tauri::async_runtime::spawn_blocking(move || toggle_codex_skill_inner(config_dir, id, enabled))
         .await
         .map_err(|e| CodexxError::Config(format!("切换 Skill 失败: {e}")))?
 }
 
 #[tauri::command]
-async fn toggle_codex_mcp(config_dir: Option<String>, id: String, enabled: bool) -> Result<SkillsMcpState> {
+async fn toggle_codex_mcp(
+    config_dir: Option<String>,
+    id: String,
+    enabled: bool,
+) -> Result<SkillsMcpState> {
     tauri::async_runtime::spawn_blocking(move || toggle_codex_mcp_inner(config_dir, id, enabled))
         .await
         .map_err(|e| CodexxError::Config(format!("切换 MCP 失败: {e}")))?
 }
 
 #[tauri::command]
-async fn install_skill_zip(config_dir: Option<String>, file_name: String, bytes: Vec<u8>) -> Result<SkillsMcpActionResult> {
-    tauri::async_runtime::spawn_blocking(move || install_skill_zip_inner(config_dir, file_name, bytes))
-        .await
-        .map_err(|e| CodexxError::Config(format!("ZIP 安装 Skill 失败: {e}")))?
+async fn install_skill_zip(
+    config_dir: Option<String>,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> Result<SkillsMcpActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        install_skill_zip_inner(config_dir, file_name, bytes)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("ZIP 安装 Skill 失败: {e}")))?
 }
 
 #[tauri::command]
@@ -2929,9 +3206,11 @@ async fn get_session_sync_status(
     config_dir: Option<String>,
     target_provider: Option<String>,
 ) -> Result<SessionSyncStatus> {
-    tauri::async_runtime::spawn_blocking(move || session_sync_status_inner(config_dir, target_provider))
-        .await
-        .map_err(|e| CodexxError::Config(format!("读取会话状态失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        session_sync_status_inner(config_dir, target_provider)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("读取会话状态失败: {e}")))?
 }
 
 #[tauri::command]
@@ -2939,13 +3218,17 @@ async fn sync_sessions_provider(
     config_dir: Option<String>,
     target_provider: Option<String>,
 ) -> Result<SessionSyncResult> {
-    tauri::async_runtime::spawn_blocking(move || sync_sessions_provider_inner(config_dir, target_provider))
-        .await
-        .map_err(|e| CodexxError::Config(format!("同步会话失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_sessions_provider_inner(config_dir, target_provider)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("同步会话失败: {e}")))?
 }
 
 #[tauri::command]
-async fn sync_selected_sessions_provider(input: SelectedSessionSyncInput) -> Result<SessionSyncResult> {
+async fn sync_selected_sessions_provider(
+    input: SelectedSessionSyncInput,
+) -> Result<SessionSyncResult> {
     tauri::async_runtime::spawn_blocking(move || sync_selected_sessions_provider_inner(input))
         .await
         .map_err(|e| CodexxError::Config(format!("同步选中会话失败: {e}")))?
@@ -2974,13 +3257,17 @@ fn get_about_info(config_dir: Option<String>) -> Result<AboutInfo> {
 }
 
 #[tauri::command]
-fn list_saved_prompts() -> Result<Vec<SavedPrompt>> {
-    list_saved_prompts_inner()
+async fn list_saved_prompts() -> Result<Vec<SavedPrompt>> {
+    tauri::async_runtime::spawn_blocking(list_saved_prompts_inner)
+        .await
+        .map_err(|e| CodexxError::Config(format!("读取提示词列表失败: {e}")))?
 }
 
 #[tauri::command]
-fn get_builtin_prompt_status() -> Result<Vec<BuiltinPromptStatus>> {
-    builtin_prompt_status_inner()
+async fn get_builtin_prompt_status() -> Result<Vec<BuiltinPromptStatus>> {
+    tauri::async_runtime::spawn_blocking(builtin_prompt_status_inner)
+        .await
+        .map_err(|e| CodexxError::Config(format!("读取内置提示词状态失败: {e}")))?
 }
 
 #[tauri::command]
@@ -2991,13 +3278,16 @@ async fn refresh_builtin_prompts() -> Result<Vec<BuiltinPromptStatus>> {
 }
 
 #[tauri::command]
-fn remember_current_instruction(config_dir: Option<String>) -> Result<Option<SavedPrompt>> {
-    let codex_dir = resolve_codex_dir(config_dir)?;
-    remember_current_instruction_prompt(&codex_dir)
+async fn remember_current_instruction(config_dir: Option<String>) -> Result<Option<SavedPrompt>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let codex_dir = resolve_codex_dir(config_dir)?;
+        remember_current_instruction_prompt(&codex_dir)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("保存当前外部提示词失败: {e}")))?
 }
 
-#[tauri::command]
-fn save_prompt(prompt: SavedPrompt) -> Result<SavedPrompt> {
+fn save_prompt_command_inner(prompt: SavedPrompt) -> Result<SavedPrompt> {
     let title = prompt.title.trim().to_string();
     if title.is_empty() {
         return Err(CodexxError::Config("提示词名称不能为空".to_string()));
@@ -3021,12 +3311,20 @@ fn save_prompt(prompt: SavedPrompt) -> Result<SavedPrompt> {
 }
 
 #[tauri::command]
-fn delete_saved_prompt(id: String) -> Result<()> {
-    delete_prompt_inner(id.trim())
+async fn save_prompt(prompt: SavedPrompt) -> Result<SavedPrompt> {
+    tauri::async_runtime::spawn_blocking(move || save_prompt_command_inner(prompt))
+        .await
+        .map_err(|e| CodexxError::Config(format!("保存提示词失败: {e}")))?
 }
 
 #[tauri::command]
-fn enable_saved_prompt(config_dir: Option<String>, id: String) -> Result<ActionResult> {
+async fn delete_saved_prompt(id: String) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || delete_prompt_inner(id.trim()))
+        .await
+        .map_err(|e| CodexxError::Config(format!("删除提示词失败: {e}")))?
+}
+
+fn enable_saved_prompt_inner(config_dir: Option<String>, id: String) -> Result<ActionResult> {
     let prompt = get_saved_prompt_inner(id.trim())?;
     let codex_dir = resolve_codex_dir(config_dir)?;
     let _ = remember_current_instruction_prompt(&codex_dir);
@@ -3050,6 +3348,13 @@ fn enable_saved_prompt(config_dir: Option<String>, id: String) -> Result<ActionR
         backup_id,
         state,
     })
+}
+
+#[tauri::command]
+async fn enable_saved_prompt(config_dir: Option<String>, id: String) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || enable_saved_prompt_inner(config_dir, id))
+        .await
+        .map_err(|e| CodexxError::Config(format!("启用自定义提示词失败: {e}")))?
 }
 
 #[tauri::command]
@@ -3213,20 +3518,25 @@ fn enable_instruction_inner(config_dir: Option<String>, template_id: &str) -> Re
 }
 
 #[tauri::command]
-fn enable_instruction(config_dir: Option<String>) -> Result<ActionResult> {
-    enable_instruction_inner(config_dir, "gpt5.5-unrestricted")
+async fn enable_instruction(config_dir: Option<String>) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        enable_instruction_inner(config_dir, "gpt5.5-unrestricted")
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("启用指令提示词失败: {e}")))?
 }
 
 #[tauri::command]
-fn enable_instruction_template(
+async fn enable_instruction_template(
     config_dir: Option<String>,
     template_id: String,
 ) -> Result<ActionResult> {
-    enable_instruction_inner(config_dir, &template_id)
+    tauri::async_runtime::spawn_blocking(move || enable_instruction_inner(config_dir, &template_id))
+        .await
+        .map_err(|e| CodexxError::Config(format!("启用指令提示词失败: {e}")))?
 }
 
-#[tauri::command]
-fn disable_instruction(
+fn disable_instruction_inner(
     config_dir: Option<String>,
     delete_file: Option<bool>,
 ) -> Result<ActionResult> {
@@ -3263,6 +3573,16 @@ fn disable_instruction(
         backup_id,
         state,
     })
+}
+
+#[tauri::command]
+async fn disable_instruction(
+    config_dir: Option<String>,
+    delete_file: Option<bool>,
+) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || disable_instruction_inner(config_dir, delete_file))
+        .await
+        .map_err(|e| CodexxError::Config(format!("禁用指令提示词失败: {e}")))?
 }
 
 #[tauri::command]

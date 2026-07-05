@@ -2010,6 +2010,10 @@ html, body, #root {
   overflow: hidden;
   animation: boot-panel-in .42s cubic-bezier(.2,.8,.2,1) both;
 }
+.boot-panel.leaving {
+  pointer-events: none;
+  animation: boot-panel-out .28s ease-in both;
+}
 .boot-panel::before {
   content: "";
   position: absolute;
@@ -2090,6 +2094,10 @@ html, body, #root {
 @keyframes boot-panel-in {
   from { opacity: 0; transform: translateY(10px) scale(.985); }
   to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes boot-panel-out {
+  from { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+  to { opacity: 0; transform: translateY(-8px) scale(.992); filter: blur(4px); }
 }
 @keyframes boot-logo-float {
   0%, 100% { transform: translateY(0); filter: brightness(1); }

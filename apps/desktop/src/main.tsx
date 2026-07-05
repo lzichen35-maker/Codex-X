@@ -816,6 +816,8 @@ function App() {
   const [backups, setBackups] = React.useState<BackupEntry[]>([]);
   const [configDir, setConfigDir] = React.useState("");
   const [loading, setLoading] = React.useState(false);
+  const [bootVisible, setBootVisible] = React.useState(true);
+  const [bootLeaving, setBootLeaving] = React.useState(false);
   const [toast, setToast] = React.useState<string>("");
   const [error, setError] = React.useState<string>("");
   const [providerForm, setProviderForm] = React.useState<SavedProvider>(defaultProviderForm);
@@ -830,6 +832,7 @@ function App() {
   const skillZipImportRef = React.useRef<HTMLInputElement | null>(null);
   const promptUpdateCheckedRef = React.useRef(false);
   const skillsMcpLoadedRef = React.useRef(false);
+  const bootStartedAtRef = React.useRef(Date.now());
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm, state), [providerForm, state]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile);
@@ -851,6 +854,18 @@ function App() {
       setProviderTomlDraft(providerTomlPreview);
     }
   }, [providerMode, providerTomlDirty, providerTomlPreview]);
+
+  React.useEffect(() => {
+    if (!state || !bootVisible || bootLeaving) return undefined;
+    const elapsed = Date.now() - bootStartedAtRef.current;
+    const minBootMs = 920;
+    const leaveDelay = Math.max(120, minBootMs - elapsed);
+    const leaveTimer = window.setTimeout(() => {
+      setBootLeaving(true);
+      window.setTimeout(() => setBootVisible(false), 300);
+    }, leaveDelay);
+    return () => window.clearTimeout(leaveTimer);
+  }, [bootLeaving, bootVisible, state]);
 
 
   const currentProvider = state?.providers.find((p) => p.isCurrent);
@@ -1702,8 +1717,8 @@ function App() {
           </div>
         )}
 
-        {!state ? (
-          <div className="panel glass center-panel boot-panel">
+        {(!state || bootVisible) ? (
+          <div className={cx("panel glass center-panel boot-panel", bootLeaving && "leaving")}>
             <div className="boot-logo-wrap">
               <div className="boot-logo">Codex-X</div>
               <div className="boot-orbit" />
