@@ -2,6 +2,15 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [v0.2.19] - 2026-07-06
+
+- 新增【技能和 MCP】页面：展示 Codex 当前已安装 Skills 与 MCP，支持导入已有、从 ZIP 安装 Skill、启用/禁用 Skill、启用/禁用 MCP。
+- MCP 管理会读写 `~/.codex/config.toml` 的 `[mcp_servers]`，禁用后保留到 Codex-X SQLite，后续可一键重新启用。
+- Skills 管理会扫描 `~/.codex/skills`，并可从 `~/.agents/skills`、`~/.cc-switch/skills` 导入到 Codex；禁用后移动到 Codex-X 禁用目录，避免直接删除。
+- 优化多个潜在卡顿点：指令提示词 GitHub 检查改为延迟后台执行，远程拉取、会话扫描/同步、Skills/MCP 扫描均放入后台 blocking worker。
+- 修复外部自定义提示词切换到内置提示词后重复出现的问题，并自动清理同名 `external-*` 重复项。
+- 增加页面切换过渡、启动页动态光效和首次启动向导退出动画，降低页面突然跳转感。
+
 ## [v0.2.18] - 2026-07-05
 
 - 指令提示词内置模板支持从 GitHub `examples/` 实时检查更新，并缓存到本地；启用内置模板时优先使用 GitHub 最新版本，离线时自动回退本地缓存或打包内置版本。

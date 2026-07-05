@@ -34,7 +34,7 @@ import "./styles.css";
 type Lang = "zh" | "en";
 type ProviderMode = "list" | "form" | "official";
 type InstructionMode = "list" | "form";
-type Tab = "dashboard" | "provider" | "sessions" | "instruction" | "toml" | "settings" | "about";
+type Tab = "dashboard" | "provider" | "sessions" | "skillsMcp" | "instruction" | "toml" | "settings" | "about";
 
 type InstructionTemplate = {
   id: string;
@@ -183,6 +183,46 @@ type SessionSyncResult = {
   backupDir: string;
 };
 
+type ManagedSkill = {
+  id: string;
+  name: string;
+  description?: string | null;
+  directory: string;
+  enabled: boolean;
+  source: string;
+  path: string;
+  contentHash?: string | null;
+  updateStatus: string;
+};
+
+type ManagedMcpServer = {
+  id: string;
+  name: string;
+  transport: string;
+  enabled: boolean;
+  source: string;
+  summary: string;
+  command?: string | null;
+  url?: string | null;
+  configJson: unknown;
+};
+
+type SkillsMcpState = {
+  codexDir: string;
+  codexSkillsDir: string;
+  disabledSkillsDir: string;
+  skills: ManagedSkill[];
+  mcpServers: ManagedMcpServer[];
+  warnings: string[];
+};
+
+type SkillsMcpActionResult = {
+  importedSkills: number;
+  importedMcp: number;
+  message: string;
+  state: SkillsMcpState;
+};
+
 type DiagnosticItem = {
   key: string;
   label: string;
@@ -257,6 +297,7 @@ const dict = {
       dashboard: "概览",
       provider: "供应商",
       sessions: "会话管理",
+      skillsMcp: "技能和MCP",
       instruction: "指令提示词",
       toml: "TOML",
       settings: "设置",
@@ -364,6 +405,7 @@ const dict = {
       dashboard: "Overview",
       provider: "Provider",
       sessions: "Sessions",
+      skillsMcp: "Skills & MCP",
       instruction: "Prompt",
       toml: "TOML",
       settings: "Settings",
@@ -763,8 +805,10 @@ function App() {
   const [releaseInfo, setReleaseInfo] = React.useState<ReleaseInfo>({ status: "idle" });
   const [updatePromptOpen, setUpdatePromptOpen] = React.useState(false);
   const [sessionStatus, setSessionStatus] = React.useState<SessionSyncStatus | null>(null);
+  const [skillsMcpState, setSkillsMcpState] = React.useState<SkillsMcpState | null>(null);
   const [startupDiagnostics, setStartupDiagnostics] = React.useState<StartupDiagnostics | null>(null);
   const [startupWizardOpen, setStartupWizardOpen] = React.useState(() => localStorage.getItem(STARTUP_WIZARD_SEEN_KEY) !== "1");
+  const [startupClosing, setStartupClosing] = React.useState(false);
   const [sessionQuery, setSessionQuery] = React.useState("");
   const [sessionGroupByCwd, setSessionGroupByCwd] = React.useState(true);
   const [selectedSessionIds, setSelectedSessionIds] = React.useState<string[]>([]);
@@ -783,7 +827,9 @@ function App() {
   const [officialForm, setOfficialForm] = React.useState({ model: "gpt-5.5", authJson: "" });
   const autoUpdateCheckedRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
+  const skillZipImportRef = React.useRef<HTMLInputElement | null>(null);
   const promptUpdateCheckedRef = React.useRef(false);
+  const skillsMcpLoadedRef = React.useRef(false);
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm, state), [providerForm, state]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile);
@@ -888,6 +934,9 @@ function App() {
     const set = new Set(selectedSessionIds);
     return (sessionStatus?.sessions || []).filter((item) => set.has(item.id) && item.needsSync).length;
   }, [selectedSessionIds, sessionStatus?.sessions]);
+
+  const enabledSkillCount = skillsMcpState?.skills.filter((item) => item.enabled).length ?? 0;
+  const enabledMcpCount = skillsMcpState?.mcpServers.filter((item) => item.enabled).length ?? 0;
 
   React.useEffect(() => {
     setSelectedSessionIds((ids) => ids.filter((id) => (sessionStatus?.sessions || []).some((item) => item.id === id)));
@@ -1061,8 +1110,10 @@ function App() {
   };
 
   const refreshBuiltinPrompts = async ({ quiet = false }: { quiet?: boolean } = {}) => {
-    setActionBusy("refreshPrompts");
-    if (!quiet) setLoading(true);
+    if (!quiet) {
+      setActionBusy("refreshPrompts");
+      setLoading(true);
+    }
     try {
       const list = await invoke<BuiltinPromptStatus[]>("refresh_builtin_prompts");
       setBuiltinPromptStatus(list);
@@ -1075,8 +1126,10 @@ function App() {
     } catch (e) {
       if (!quiet) setError(String(e));
     } finally {
-      if (!quiet) setLoading(false);
-      setActionBusy("");
+      if (!quiet) {
+        setLoading(false);
+        setActionBusy("");
+      }
     }
   };
 
@@ -1246,9 +1299,111 @@ function App() {
   React.useEffect(() => {
     if (tab !== "instruction" || promptUpdateCheckedRef.current) return;
     promptUpdateCheckedRef.current = true;
-    void refreshBuiltinPrompts({ quiet: true });
+    const timer = window.setTimeout(() => {
+      void refreshBuiltinPrompts({ quiet: true });
+    }, 800);
+    return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab]);
+
+  const loadSkillsMcp = React.useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
+    if (!quiet) {
+      setActionBusy("loadSkillsMcp");
+      setError("");
+    }
+    try {
+      const result = await invoke<SkillsMcpState>("get_skills_mcp_state", { configDir: configDir || null });
+      setSkillsMcpState(result);
+    } catch (e) {
+      if (!quiet) setError(String(e));
+    } finally {
+      if (!quiet) setActionBusy("");
+    }
+  }, [configDir]);
+
+  React.useEffect(() => {
+    if (tab !== "skillsMcp" || skillsMcpLoadedRef.current) return;
+    skillsMcpLoadedRef.current = true;
+    void loadSkillsMcp();
+  }, [tab, loadSkillsMcp]);
+
+  const importExistingSkillsMcp = async () => {
+    setActionBusy("importExistingSkillsMcp");
+    setError("");
+    try {
+      const result = await invoke<SkillsMcpActionResult>("import_existing_skills_mcp", { configDir: configDir || null });
+      setSkillsMcpState(result.state);
+      setToast(result.message);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const checkSkillUpdatesAction = async () => {
+    setActionBusy("checkSkillUpdates");
+    setError("");
+    try {
+      const result = await invoke<SkillsMcpState>("check_skill_updates", { configDir: configDir || null });
+      setSkillsMcpState(result);
+      setToast(lang === "zh" ? "Skills 更新状态已刷新" : "Skill update status refreshed");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const toggleSkillEnabled = async (id: string, enabled: boolean) => {
+    setActionBusy(`skill:${id}`);
+    setError("");
+    try {
+      const result = await invoke<SkillsMcpState>("toggle_codex_skill", { configDir: configDir || null, id, enabled });
+      setSkillsMcpState(result);
+      setToast(enabled ? (lang === "zh" ? "Skill 已启用" : "Skill enabled") : (lang === "zh" ? "Skill 已禁用" : "Skill disabled"));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const toggleMcpEnabled = async (id: string, enabled: boolean) => {
+    setActionBusy(`mcp:${id}`);
+    setError("");
+    try {
+      const result = await invoke<SkillsMcpState>("toggle_codex_mcp", { configDir: configDir || null, id, enabled });
+      setSkillsMcpState(result);
+      setToast(enabled ? (lang === "zh" ? "MCP 已启用" : "MCP enabled") : (lang === "zh" ? "MCP 已禁用" : "MCP disabled"));
+      void refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const installSkillZipFile = async (file?: File | null) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".zip")) {
+      setError(lang === "zh" ? "请选择 .zip 技能包" : "Please choose a .zip skill package");
+      return;
+    }
+    setActionBusy("installSkillZip");
+    setError("");
+    try {
+      const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+      const result = await invoke<SkillsMcpActionResult>("install_skill_zip", { configDir: configDir || null, fileName: file.name, bytes });
+      setSkillsMcpState(result.state);
+      setToast(result.message);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionBusy("");
+      if (skillZipImportRef.current) skillZipImportRef.current.value = "";
+    }
+  };
 
   const loadCcSwitchOfficialAuth = async (showToast = true) => {
     const candidate = await invoke<OfficialAuthCandidate | null>("read_ccswitch_official_auth", { dbPath: null });
@@ -1397,13 +1552,18 @@ function App() {
 
   const closeStartupWizard = () => {
     localStorage.setItem(STARTUP_WIZARD_SEEN_KEY, "1");
-    setStartupWizardOpen(false);
+    setStartupClosing(true);
+    window.setTimeout(() => {
+      setStartupWizardOpen(false);
+      setStartupClosing(false);
+    }, 260);
   };
 
   const navItems: Array<[Tab, string, React.ReactNode]> = [
     ["dashboard", t.nav.dashboard, <Layers3 size={18} />],
     ["provider", t.nav.provider, <Zap size={18} />],
     ["sessions", t.nav.sessions, <History size={18} />],
+    ["skillsMcp", t.nav.skillsMcp, <Layers3 size={18} />],
     ["instruction", t.nav.instruction, <Sparkles size={18} />],
     ["toml", t.nav.toml, <FileCode2 size={18} />],
     ["settings", t.nav.settings, <Settings size={18} />],
@@ -1495,7 +1655,7 @@ function App() {
         )}
 
         {startupWizardOpen && startupDiagnostics && (
-          <div className="startup-mask">
+          <div className={cx("startup-mask", startupClosing && "closing")}>
             <div className="startup-card glass">
               <div className="startup-head">
                 <div>
@@ -1543,9 +1703,13 @@ function App() {
         )}
 
         {!state ? (
-          <div className="panel glass center-panel">
-            <Loader2 className="spin" />
+          <div className="panel glass center-panel boot-panel">
+            <div className="boot-logo-wrap">
+              <div className="boot-logo">Codex-X</div>
+              <div className="boot-orbit" />
+            </div>
             <p>{t.loadingConfig}</p>
+            <div className="boot-progress"><span /></div>
           </div>
         ) : (
           <>
@@ -1907,6 +2071,126 @@ function App() {
                     {sessionStatus.warnings.map((item, index) => <p key={index}><AlertCircle size={15} /> {item}</p>)}
                   </div>
                 ) : null}
+              </section>
+            )}
+
+            {tab === "skillsMcp" && (
+              <section className="panel glass skills-mcp-panel">
+                <div className="panel-head provider-title-row">
+                  <div>
+                    <p className="eyebrow">Skills / MCP</p>
+                    <h3>{lang === "zh" ? "技能和 MCP" : "Skills & MCP"}</h3>
+                    <p className="muted-desc">{lang === "zh" ? "管理 Codex 当前可用的 Skills 与 MCP：导入已有、从 ZIP 安装、启用或禁用。" : "Manage Codex Skills and MCP servers: import existing items, install ZIP packages, enable or disable."}</p>
+                  </div>
+                  <div className="provider-title-actions">
+                    <input
+                      ref={skillZipImportRef}
+                      className="hidden-file-input"
+                      type="file"
+                      accept=".zip,application/zip"
+                      onChange={(e) => void installSkillZipFile(e.target.files?.[0])}
+                    />
+                    <button className="ghost-btn add-provider-btn lively-btn" onClick={() => void loadSkillsMcp()} disabled={actionBusy === "loadSkillsMcp"}>
+                      {actionBusy === "loadSkillsMcp" ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />} {lang === "zh" ? "刷新" : "Refresh"}
+                    </button>
+                    <button className="secondary-btn add-provider-btn lively-btn" onClick={importExistingSkillsMcp} disabled={Boolean(actionBusy)}>
+                      {actionBusy === "importExistingSkillsMcp" ? <Loader2 size={18} className="spin" /> : <Download size={18} />} {lang === "zh" ? "导入已有" : "Import existing"}
+                    </button>
+                    <button className="secondary-btn add-provider-btn lively-btn" onClick={() => skillZipImportRef.current?.click()} disabled={Boolean(actionBusy)}>
+                      {actionBusy === "installSkillZip" ? <Loader2 size={18} className="spin" /> : <Upload size={18} />} {lang === "zh" ? "从 ZIP 安装" : "Install ZIP"}
+                    </button>
+                    <button className="primary-btn add-provider-btn lively-btn" onClick={checkSkillUpdatesAction} disabled={Boolean(actionBusy)}>
+                      {actionBusy === "checkSkillUpdates" ? <Loader2 size={18} className="spin" /> : <Sparkles size={18} />} {lang === "zh" ? "检查更新" : "Check updates"}
+                    </button>
+                  </div>
+                </div>
+
+                {!skillsMcpState ? (
+                  <div className="session-empty skills-loading">
+                    <Loader2 className="spin" size={22} />
+                    <span>{lang === "zh" ? "正在读取本地 Skills / MCP..." : "Loading local Skills / MCP..."}</span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="skills-mcp-summary">
+                      <StatCard icon={<Sparkles size={20} />} label={lang === "zh" ? "已启用 Skills" : "Enabled Skills"} value={`${enabledSkillCount}/${skillsMcpState.skills.length}`} ok={enabledSkillCount > 0} />
+                      <StatCard icon={<TerminalSquare size={20} />} label={lang === "zh" ? "已启用 MCP" : "Enabled MCP"} value={`${enabledMcpCount}/${skillsMcpState.mcpServers.length}`} ok={enabledMcpCount > 0} />
+                      <div className="skills-path-card">
+                        <span>~/.codex/skills</span>
+                        <code>{skillsMcpState.codexSkillsDir}</code>
+                      </div>
+                    </div>
+
+                    <div className="skills-mcp-columns">
+                      <section className="skills-mcp-card">
+                        <div className="skills-mcp-card-head">
+                          <div>
+                            <strong>Skills</strong>
+                            <p>{lang === "zh" ? "启用后会放入 Codex skills 目录；禁用会移动到 Codex-X 的禁用目录。" : "Enabled skills live in the Codex skills directory; disabled skills are moved into Codex-X storage."}</p>
+                          </div>
+                          <span className="mini-tag ok">{skillsMcpState.skills.length}</span>
+                        </div>
+                        <div className="skills-mcp-list">
+                          {skillsMcpState.skills.length === 0 ? (
+                            <div className="session-empty compact"><Sparkles size={18} /><span>{lang === "zh" ? "还没有发现 Skills，点击导入已有或从 ZIP 安装。" : "No Skills found. Import existing or install a ZIP."}</span></div>
+                          ) : skillsMcpState.skills.map((skill) => (
+                            <article className={cx("skill-mcp-row", skill.enabled && "selected")} key={skill.id}>
+                              <div className="instruction-icon custom"><Sparkles size={20} /></div>
+                              <div className="skill-mcp-main">
+                                <strong>{skill.name}</strong>
+                                <p>{skill.description || (lang === "zh" ? "无描述" : "No description")}</p>
+                                <code title={skill.path}>{skill.directory}</code>
+                              </div>
+                              <div className="skill-mcp-meta">
+                                <span className={cx("mini-tag", skill.enabled ? "ok" : undefined)}>{skill.enabled ? (lang === "zh" ? "已启用" : "Enabled") : (lang === "zh" ? "已禁用" : "Disabled")}</span>
+                                <small>{skill.updateStatus}</small>
+                              </div>
+                              <button className={cx(skill.enabled ? "ghost-btn" : "secondary-btn", "small", "lively-btn")} onClick={() => void toggleSkillEnabled(skill.id, !skill.enabled)} disabled={actionBusy === `skill:${skill.id}`}>
+                                {actionBusy === `skill:${skill.id}` ? <Loader2 size={14} className="spin" /> : null}{skill.enabled ? (lang === "zh" ? "禁用" : "Disable") : (lang === "zh" ? "启用" : "Enable")}
+                              </button>
+                            </article>
+                          ))}
+                        </div>
+                      </section>
+
+                      <section className="skills-mcp-card">
+                        <div className="skills-mcp-card-head">
+                          <div>
+                            <strong>MCP</strong>
+                            <p>{lang === "zh" ? "启用会写入 ~/.codex/config.toml 的 [mcp_servers]；禁用会移除但保留在 Codex-X。" : "Enabling writes to ~/.codex/config.toml [mcp_servers]; disabling removes it but keeps a Codex-X copy."}</p>
+                          </div>
+                          <span className="mini-tag ok">{skillsMcpState.mcpServers.length}</span>
+                        </div>
+                        <div className="skills-mcp-list">
+                          {skillsMcpState.mcpServers.length === 0 ? (
+                            <div className="session-empty compact"><TerminalSquare size={18} /><span>{lang === "zh" ? "还没有发现 MCP。当前会从 config.toml 导入已有 MCP。" : "No MCP server found. Existing config.toml MCP entries can be imported."}</span></div>
+                          ) : skillsMcpState.mcpServers.map((server) => (
+                            <article className={cx("skill-mcp-row", server.enabled && "selected")} key={server.id}>
+                              <div className="instruction-icon"><TerminalSquare size={20} /></div>
+                              <div className="skill-mcp-main">
+                                <strong>{server.name || server.id}</strong>
+                                <p title={server.summary}>{server.summary || server.transport}</p>
+                                <code>{server.transport} · {server.source}</code>
+                              </div>
+                              <div className="skill-mcp-meta">
+                                <span className={cx("mini-tag", server.enabled ? "ok" : undefined)}>{server.enabled ? (lang === "zh" ? "已启用" : "Enabled") : (lang === "zh" ? "已禁用" : "Disabled")}</span>
+                              </div>
+                              <button className={cx(server.enabled ? "ghost-btn" : "secondary-btn", "small", "lively-btn")} onClick={() => void toggleMcpEnabled(server.id, !server.enabled)} disabled={actionBusy === `mcp:${server.id}`}>
+                                {actionBusy === `mcp:${server.id}` ? <Loader2 size={14} className="spin" /> : null}{server.enabled ? (lang === "zh" ? "关闭" : "Disable") : (lang === "zh" ? "开启" : "Enable")}
+                              </button>
+                            </article>
+                          ))}
+                        </div>
+                      </section>
+                    </div>
+
+                    {skillsMcpState.warnings.length > 0 && (
+                      <div className="session-warning-list">
+                        {skillsMcpState.warnings.map((item, index) => <p key={index}><AlertCircle size={15} /> {item}</p>)}
+                      </div>
+                    )}
+                  </>
+                )}
               </section>
             )}
 

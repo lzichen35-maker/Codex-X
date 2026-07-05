@@ -1,6 +1,6 @@
 [package]
 name = "codex-x"
-version = "0.2.18"
+version = "0.2.19"
 description = "Codex Switch & Instruct desktop manager"
 authors = ["yynxxxxx"]
 license = "MIT"
@@ -24,3 +24,5 @@ dirs = "5.0"
 thiserror = "2.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 ureq = { version = "2.12", features = ["tls"] }
+sha2 = "0.10"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
