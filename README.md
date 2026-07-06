@@ -318,9 +318,7 @@ xattr -dr com.apple.quarantine /Applications/Codex-X.app
 ## Star History
 
 <a href="https://www.star-history.com/?repos=yynxxxxx%2FCodex-X&type=date&legend=top-left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=yynxxxxx/Codex-X&type=date&theme=dark&legend=top-left" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=yynxxxxx/Codex-X&type=date&legend=top-left" />
-    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=yynxxxxx/Codex-X&type=date&legend=top-left" />
-  </picture>
+  <img alt="Star History Chart" src="docs/star-history-codex-x.svg" width="900" />
 </a>
+
+<!-- Use a local SVG because api.star-history.com/chart may return an empty SVG for very new or fast-growing repositories. Click the chart for the live Star History page. -->
