@@ -3,6 +3,28 @@
 All notable changes to Codex-X will be documented here.
 
 
+## [v0.2.29] - 2026-07-07
+
+### 更新
+
+- 优化 Toast 提示样式：改为窗口顶部居中的产品化通知卡片，减少遮挡右上角操作按钮。
+- Provider 连接测试文案改为简洁结果：成功显示“连接正常（耗时）”，失败显示 HTTP 状态与耗时。
+- 第三方供应商编辑页支持保存 TOML 模板；点击“保存”只保存配置，点击“启用”时才写入 Codex live config。
+- 技能和 MCP 页面“导入已有”改为先展示预览确认弹窗，列出将导入的 Skills / MCP，用户确认后才执行导入。
+
+### 修复 Bug
+
+- 修复 Codex 第三方 API auth 写入错误：`auth.json` 现在写入 Codex 实际识别的 `auth_mode = "apikey"`，避免桌面端回到登录页。
+- 修复官方认证编辑页打开时会静默加载 cc-switch 旧 token，导致新登录账号 token 显示不更新的问题；现在默认读取 live `~/.codex/auth.json`，并提供“刷新当前 auth.json”。
+- 修复切换到 OpenAI Official 时可能覆盖当前 live auth.json 的问题，避免把旧账号登录态写回。
+- 修复 Provider 测试把 HTTP 403 误判为“连接正常”的问题；现在只有 2xx 状态会显示成功。
+- 修复从 cc-switch 导入 Provider 时同名同 URL 供应商可能产生重复卡片的问题。
+- 修复 SQLite 轻量迁移重复执行时 `duplicate column name: toml_config` 导致启动报错的问题。
+
+### 开发
+
+- 增加 Provider/auth 相关单元测试，覆盖第三方切换、官方 auth 保留、403 判定和 cc-switch 导入串台场景。
+
 
 ## [v0.2.28] - 2026-07-07
 
@@ -23,7 +45,7 @@ All notable changes to Codex-X will be documented here.
 ## [v0.2.26] - 2026-07-07
 
 - 修复第三方 Provider 切换后可能“看起来已切换但实际未按新供应商生效”的问题：不再把所有第三方都写成 `model_provider = "custom"`，而是写入供应商自己的稳定 ID。
-- 修复从官方 ChatGPT 登录态切到第三方 API Key 时 `auth.json` 仍保留 `auth_mode = "chatgpt"` 的问题；写入 API Key 时会同步设置 `auth_mode = "api_key"`。
+- 修复从官方 ChatGPT 登录态切到第三方 API Key 时 `auth.json` 仍保留 `auth_mode = "chatgpt"` 的问题；写入 API Key 时会同步设置 `auth_mode = "apikey"`。
 - 第三方供应商默认不再要求 OpenAI 登录态，避免新建/导入 Provider 时错误继承官方 auth 语义。
 - 增加 Provider 切换单元测试，覆盖真实 provider key 和 API Key auth mode 的落盘结果。
 

@@ -61,6 +61,7 @@ type SavedProvider = {
   baseUrl: string;
   model: string;
   apiKey?: string;
+  tomlConfig?: string;
   wireApi: string;
   requiresOpenaiAuth: boolean;
 };
@@ -152,6 +153,7 @@ type ProviderConnectionResult = {
   ok: boolean;
   status?: number | null;
   message: string;
+  durationMs: number;
 };
 
 
@@ -231,6 +233,12 @@ type SkillsMcpActionResult = {
   state: SkillsMcpState;
 };
 
+type SkillsMcpImportPreview = {
+  skills: ManagedSkill[];
+  mcpServers: ManagedMcpServer[];
+  warnings: string[];
+};
+
 type DiagnosticItem = {
   key: string;
   label: string;
@@ -286,6 +294,7 @@ const defaultProviderForm: SavedProvider = {
   baseUrl: "https://sky1818.com",
   model: "gpt-5.5",
   apiKey: "",
+  tomlConfig: "",
   wireApi: "responses",
   requiresOpenaiAuth: false,
 };
@@ -296,6 +305,7 @@ const blankProviderForm: SavedProvider = {
   baseUrl: "",
   model: "gpt-5.5",
   apiKey: "",
+  tomlConfig: "",
   wireApi: "responses",
   requiresOpenaiAuth: false,
 };
@@ -367,7 +377,9 @@ const dict = {
       officialHint: "官方配置不使用第三方路由；这里可以编辑官方模式下的模型和完整 auth.json（ChatGPT 登录通常包含 access_token / refresh_token / id_token）。",
       officialUrl: "官方入口",
       loadOfficialAuth: "从 cc-switch 载入官方认证",
+      refreshOfficialAuth: "刷新当前 auth.json",
       officialAuthLoaded: "已载入 cc-switch 官方认证",
+      officialAuthRefreshed: "已刷新当前 auth.json",
       officialAuthNotFound: "未找到 cc-switch 官方认证",
       formAdd: "添加新供应商",
       formEdit: "编辑供应商",
@@ -475,7 +487,9 @@ const dict = {
       officialHint: "Official mode does not use third-party routing. You can edit the official model and the full auth.json (ChatGPT login usually contains access_token / refresh_token / id_token).",
       officialUrl: "Official URL",
       loadOfficialAuth: "Load official auth from cc-switch",
+      refreshOfficialAuth: "Refresh current auth.json",
       officialAuthLoaded: "Loaded cc-switch official auth",
+      officialAuthRefreshed: "Current auth.json refreshed",
       officialAuthNotFound: "No cc-switch official auth found",
       formAdd: "Add provider",
       formEdit: "Edit provider",
@@ -616,7 +630,8 @@ function extractOpenAiApiKey(authText?: string) {
 function buildProviderTomlPreview(provider: SavedProvider, state: CodexState | null) {
   const model = provider.model.trim() || "gpt-5.5";
   const name = provider.providerName.trim() || "your-provider";
-  const providerKey = customProviderId(provider.id || name || provider.baseUrl || "custom");
+  // Codex live config follows cc-switch: all third-party providers are applied as `custom`.
+  const providerKey = "custom";
   const baseUrl = provider.baseUrl.trim().replace(/\/+$/, "") || "https://example.com/v1";
   const wireApi = provider.wireApi || "responses";
   const apiKey = provider.apiKey?.trim();
@@ -669,7 +684,6 @@ function buildProviderTomlPreview(provider: SavedProvider, state: CodexState | n
     `base_url = "${tomlEscape(baseUrl)}"`,
     `wire_api = "${tomlEscape(wireApi)}"`,
     `requires_openai_auth = ${provider.requiresOpenaiAuth ? "true" : "false"}`,
-    ...(apiKey ? [`experimental_bearer_token = "${tomlEscape(apiKey)}"`] : []),
   ];
 
   return [
@@ -684,7 +698,7 @@ function buildProviderTomlPreview(provider: SavedProvider, state: CodexState | n
 
 function buildProviderAuthPreview(provider: SavedProvider) {
   const key = provider.apiKey?.trim();
-  return JSON.stringify({ OPENAI_API_KEY: key || null, auth_mode: key ? "api_key" : undefined }, null, 2);
+  return JSON.stringify({ OPENAI_API_KEY: key || null, auth_mode: key ? "apikey" : undefined }, null, 2);
 }
 
 
@@ -840,6 +854,8 @@ function App() {
   const [updatePromptOpen, setUpdatePromptOpen] = React.useState(false);
   const [sessionStatus, setSessionStatus] = React.useState<SessionSyncStatus | null>(null);
   const [skillsMcpState, setSkillsMcpState] = React.useState<SkillsMcpState | null>(null);
+  const [skillsMcpImportPreview, setSkillsMcpImportPreview] = React.useState<SkillsMcpImportPreview | null>(null);
+  const [skillsMcpImportOpen, setSkillsMcpImportOpen] = React.useState(false);
   const [startupDiagnostics, setStartupDiagnostics] = React.useState<StartupDiagnostics | null>(null);
   const [startupWizardOpen, setStartupWizardOpen] = React.useState(() => localStorage.getItem(STARTUP_WIZARD_SEEN_KEY) !== "1");
   const [startupClosing, setStartupClosing] = React.useState(false);
@@ -1227,6 +1243,7 @@ function App() {
     baseUrl: providerForm.baseUrl.trim().replace(/\/+$/, ""),
     model: providerForm.model.trim(),
     apiKey: (providerForm.apiKey || "").trim(),
+    tomlConfig: (providerTomlDraft || providerForm.tomlConfig || buildProviderTomlPreview(providerForm, state)).trimEnd(),
     wireApi: providerForm.wireApi || "responses",
     requiresOpenaiAuth: providerForm.requiresOpenaiAuth,
   });
@@ -1248,14 +1265,25 @@ function App() {
         setSavedProviders(providerList);
         setProviderMode("list");
         setEditingProviderId(null);
-        setToast(lang === "zh" ? "供应商已保存到 SQLite" : "Provider saved to SQLite");
+        setProviderTomlDirty(false);
+        setToast(lang === "zh" ? "供应商配置已保存" : "Provider saved");
       },
     );
 
   const switchProvider = (provider: SavedProvider) =>
     call(
-      () =>
-        invoke<ActionResult>("switch_provider", {
+      () => {
+        const tomlConfig = provider.tomlConfig?.trim();
+        if (tomlConfig) {
+          return invoke<ActionResult>("save_provider_toml_config", {
+            input: {
+              configDir: configDir || null,
+              configText: tomlConfig,
+              apiKey: provider.apiKey || "",
+            },
+          });
+        }
+        return invoke<ActionResult>("switch_provider", {
           input: {
             configDir: configDir || null,
             providerId: provider.id,
@@ -1266,18 +1294,19 @@ function App() {
             wireApi: provider.wireApi,
             requiresOpenaiAuth: provider.requiresOpenaiAuth,
           },
-        }),
+        });
+      },
       handleActionResult,
     );
 
-  const testProvider = async (id: string, baseUrl: string) => {
+  const testProvider = async (id: string, baseUrl: string, apiKey?: string | null) => {
     setProviderTestingId(id);
     setError("");
     try {
-      const result = await invoke<ProviderConnectionResult>("test_provider_connection", { baseUrl });
+      const result = await invoke<ProviderConnectionResult>("test_provider_connection", { baseUrl, apiKey: apiKey || null });
       setToast(result.ok
-        ? (lang === "zh" ? `连接正常：${result.message}` : `Connection OK: ${result.message}`)
-        : (lang === "zh" ? `连接失败：${result.message}` : `Connection failed: ${result.message}`));
+        ? (lang === "zh" ? `连接正常\n${result.durationMs} ms` : `Connection OK\n${result.durationMs} ms`)
+        : (lang === "zh" ? `连接失败\n${result.message}` : `Connection failed\n${result.message}`));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1285,28 +1314,7 @@ function App() {
     }
   };
 
-  const saveAndSwitch = () =>
-    call(
-      async () => {
-        const saved = await invoke<SavedProvider>("save_provider", { provider: normalizedProviderForm() });
-        const result = await invoke<ActionResult>("save_provider_toml_config", {
-          input: {
-            configDir: configDir || null,
-            configText: providerTomlDraft || buildProviderTomlPreview(saved, state),
-            apiKey: saved.apiKey || "",
-          },
-        });
-        const providerList = await invoke<SavedProvider[]>("list_saved_providers");
-        return { result, providerList };
-      },
-      ({ result, providerList }) => {
-        setSavedProviders(providerList);
-        setProviderMode("list");
-        setEditingProviderId(null);
-        setProviderTomlDirty(false);
-        handleActionResult(result);
-      },
-    );
+  const saveProviderConfig = saveProviderOnly;
 
   const switchOfficialProvider = () =>
     call(
@@ -1435,12 +1443,28 @@ function App() {
     void loadSkillsMcp();
   }, [tab, loadSkillsMcp]);
 
+  const openImportExistingSkillsMcpPreview = async () => {
+    setActionBusy("previewExistingSkillsMcp");
+    setError("");
+    try {
+      const preview = await invoke<SkillsMcpImportPreview>("preview_existing_skills_mcp", { configDir: configDir || null });
+      setSkillsMcpImportPreview(preview);
+      setSkillsMcpImportOpen(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionBusy("");
+    }
+  };
+
   const importExistingSkillsMcp = async () => {
     setActionBusy("importExistingSkillsMcp");
     setError("");
     try {
       const result = await invoke<SkillsMcpActionResult>("import_existing_skills_mcp", { configDir: configDir || null });
       setSkillsMcpState(result.state);
+      setSkillsMcpImportOpen(false);
+      setSkillsMcpImportPreview(null);
       setToast(result.message);
     } catch (e) {
       setError(String(e));
@@ -1530,13 +1554,25 @@ function App() {
     return false;
   };
 
+  const officialAuthPlaceholder = '{\n  "OPENAI_API_KEY": null,\n  "auth_mode": "chatgpt",\n  "tokens": {\n    "access_token": "",\n    "refresh_token": "",\n    "id_token": ""\n  }\n}';
+
+  const refreshLiveOfficialAuth = async (showToast = true) => {
+    const next = await invoke<CodexState>("get_codex_state", { configDir: configDir || null });
+    setState(next);
+    setOfficialForm((form) => ({
+      ...form,
+      model: next.model || form.model || "gpt-5.5",
+      authJson: next.authText || officialAuthPlaceholder,
+    }));
+    if (showToast) setToast(t.provider.officialAuthRefreshed);
+  };
+
   const openOfficialEdit = () => {
     setOfficialForm({
       model: state?.model || "gpt-5.5",
-      authJson: state?.authText || '{\n  "OPENAI_API_KEY": null,\n  "auth_mode": "chatgpt",\n  "tokens": {\n    "access_token": "",\n    "refresh_token": "",\n    "id_token": ""\n  }\n}',
+      authJson: state?.authText || officialAuthPlaceholder,
     });
     setProviderMode("official");
-    void loadCcSwitchOfficialAuth(false);
   };
 
   const saveOfficialConfig = () =>
@@ -1567,7 +1603,7 @@ function App() {
   const openEditProvider = (provider: SavedProvider) => {
     setEditingProviderId(provider.id);
     setProviderForm(provider);
-    setProviderTomlDraft(buildProviderTomlPreview(provider, state));
+    setProviderTomlDraft(provider.tomlConfig?.trim() || buildProviderTomlPreview(provider, state));
     setProviderTomlDirty(false);
     setProviderMode("form");
   };
@@ -1580,6 +1616,7 @@ function App() {
       baseUrl: provider.baseUrl,
       model: provider.model,
       apiKey: extractOpenAiApiKey(state?.authText),
+      tomlConfig: "",
       wireApi: provider.wireApi || "responses",
       requiresOpenaiAuth: provider.requiresOpenaiAuth,
     };
@@ -1727,12 +1764,30 @@ function App() {
           </header>
         )}
 
-        {toast && (
-          <div className="toast ok" onAnimationEnd={() => setToast("")}>
-            <CheckCircle2 size={18} /> {toast}
+        {toast && (() => {
+          const [title, ...rest] = toast.split("\n");
+          const message = rest.join("\n").trim();
+          return (
+            <div className="toast ok" onAnimationEnd={() => setToast("")}>
+              <div className="toast-icon"><CheckCircle2 size={16} /></div>
+              <div className="toast-copy">
+                <strong>{title}</strong>
+                {message && <span>{message}</span>}
+              </div>
+              <button className="toast-close" onClick={() => setToast("")}>×</button>
+            </div>
+          );
+        })()}
+        {error && (
+          <div className="toast error">
+            <div className="toast-icon"><AlertCircle size={16} /></div>
+            <div className="toast-copy">
+              <strong>{lang === "zh" ? "操作失败" : "Action failed"}</strong>
+              <span>{error}</span>
+            </div>
+            <button className="toast-close" onClick={() => setError("")}>×</button>
           </div>
         )}
-        {error && <div className="toast error">{error}</div>}
         {updatePromptOpen && releaseInfo.hasUpdate && (
           <div className="update-mask" onClick={() => setUpdatePromptOpen(false)}>
             <div className="update-dialog glass" onClick={(e) => e.stopPropagation()}>
@@ -1759,6 +1814,83 @@ function App() {
                 </button>
                 <button className="secondary-btn" onClick={() => setUpdatePromptOpen(false)}>
                   {lang === "zh" ? "稍后" : "Later"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {skillsMcpImportOpen && skillsMcpImportPreview && (
+          <div className="update-mask" onClick={() => setSkillsMcpImportOpen(false)}>
+            <div className="import-preview-dialog glass" onClick={(e) => e.stopPropagation()}>
+              <div className="update-head">
+                <div className="update-icon"><Download size={21} /></div>
+                <div>
+                  <p className="eyebrow">Skills / MCP</p>
+                  <h3>{lang === "zh" ? "确认导入已有内容" : "Confirm import"}</h3>
+                </div>
+              </div>
+              <div className="import-preview-summary">
+                <div><strong>{skillsMcpImportPreview.skills.length}</strong><span>Skills</span></div>
+                <div><strong>{skillsMcpImportPreview.mcpServers.length}</strong><span>MCP</span></div>
+              </div>
+              <div className="import-preview-body">
+                {skillsMcpImportPreview.skills.length === 0 && skillsMcpImportPreview.mcpServers.length === 0 ? (
+                  <div className="session-empty compact"><span>{lang === "zh" ? "没有发现可导入的已有 Skills / MCP。" : "No existing Skills / MCP items were found."}</span></div>
+                ) : (
+                  <>
+                    <section className="import-preview-section">
+                      <div className="section-title-row">
+                        <strong>Skills</strong>
+                        <span>{skillsMcpImportPreview.skills.length}</span>
+                      </div>
+                      <div className="import-preview-list">
+                        {skillsMcpImportPreview.skills.length === 0 ? (
+                          <p className="empty">{lang === "zh" ? "没有可导入的 Skill" : "No Skill to import"}</p>
+                        ) : skillsMcpImportPreview.skills.map((skill) => (
+                          <div className="import-preview-row" key={`skill-${skill.id}-${skill.path}`}>
+                            <strong>{skill.name}</strong>
+                            <span>{skill.directory}</span>
+                            <em>{skill.source}</em>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                    <section className="import-preview-section">
+                      <div className="section-title-row">
+                        <strong>MCP</strong>
+                        <span>{skillsMcpImportPreview.mcpServers.length}</span>
+                      </div>
+                      <div className="import-preview-list">
+                        {skillsMcpImportPreview.mcpServers.length === 0 ? (
+                          <p className="empty">{lang === "zh" ? "没有可导入的 MCP" : "No MCP to import"}</p>
+                        ) : skillsMcpImportPreview.mcpServers.map((server) => (
+                          <div className="import-preview-row" key={`mcp-${server.id}-${server.source}`}>
+                            <strong>{server.name}</strong>
+                            <span>{server.transport}</span>
+                            <em>{server.source}</em>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  </>
+                )}
+                {skillsMcpImportPreview.warnings.length > 0 && (
+                  <div className="skills-mcp-warnings compact">
+                    {skillsMcpImportPreview.warnings.map((item, index) => <p key={index}><AlertCircle size={14} /> {item}</p>)}
+                  </div>
+                )}
+              </div>
+              <div className="update-actions">
+                <button
+                  className="primary-btn"
+                  onClick={importExistingSkillsMcp}
+                  disabled={Boolean(actionBusy) || (skillsMcpImportPreview.skills.length + skillsMcpImportPreview.mcpServers.length === 0)}
+                >
+                  {actionBusy === "importExistingSkillsMcp" ? <Loader2 size={16} className="spin" /> : <Download size={16} />} {lang === "zh" ? "导入" : "Import"}
+                </button>
+                <button className="secondary-btn" onClick={() => setSkillsMcpImportOpen(false)} disabled={actionBusy === "importExistingSkillsMcp"}>
+                  {lang === "zh" ? "取消" : "Cancel"}
                 </button>
               </div>
             </div>
@@ -1906,6 +2038,7 @@ function App() {
                           baseUrl: p.baseUrl,
                           model: p.model,
                           apiKey: "",
+                          tomlConfig: "",
                           wireApi: p.wireApi,
                           requiresOpenaiAuth: p.requiresOpenaiAuth,
                         };
@@ -1923,7 +2056,7 @@ function App() {
                             <div className="provider-actions">
                               <button className="secondary-btn small" onClick={() => switchable ? switchProvider(switchable) : switchOfficialProvider()} disabled={loading || p.isCurrent}>{lang === "zh" ? "启用" : "Enable"}</button>
                               {p.source !== "official" && (
-                                <button className="icon-btn small" title={lang === "zh" ? "测试连接" : "Test connection"} onClick={() => void testProvider(`${p.source}-${p.id}`, p.baseUrl)} disabled={loading || providerTestingId === `${p.source}-${p.id}`}>
+                                <button className="icon-btn small" title={lang === "zh" ? "测试连接" : "Test connection"} onClick={() => void testProvider(`${p.source}-${p.id}`, p.baseUrl, local?.apiKey || (p.source === "local" ? p.apiKey : null))} disabled={loading || providerTestingId === `${p.source}-${p.id}`}>
                                   {providerTestingId === `${p.source}-${p.id}` ? <Loader2 size={15} className="spin" /> : <Activity size={15} />}
                                 </button>
                               )}
@@ -1960,6 +2093,7 @@ function App() {
                       <textarea className="official-auth-editor" value={officialForm.authJson} onChange={(e) => setOfficialForm({ ...officialForm, authJson: e.target.value })} spellCheck={false} />
                     </label>
                     <div className="form-actions">
+                      <button className="ghost-btn big" onClick={() => void refreshLiveOfficialAuth(true)} disabled={loading}>{t.provider.refreshOfficialAuth}</button>
                       <button className="ghost-btn big" onClick={() => void loadCcSwitchOfficialAuth(true)} disabled={loading}>{t.provider.loadOfficialAuth}</button>
                       <button className="secondary-btn big" onClick={() => setProviderMode("list")}>{t.provider.cancel}</button>
                       <button className="primary-btn big" onClick={saveOfficialConfig} disabled={loading}>保存官方配置</button>
@@ -2029,7 +2163,7 @@ function App() {
                         <div className="section-title-row config-title-row">
                           <div>
                             <strong>config.toml (TOML)</strong>
-                            <p>{lang === "zh" ? "可直接编辑，保存时会写入 Codex live config.toml。" : "Editable. Saved directly to the Codex live config.toml."}</p>
+                            <p>{lang === "zh" ? "可直接编辑为供应商模板；点击启用时才写入 Codex live config.toml。" : "Editable provider template. It is written to the live Codex config.toml only when enabled."}</p>
                           </div>
                           <button className="ghost-btn small" onClick={() => { setProviderTomlDraft(providerTomlPreview); setProviderTomlDirty(false); }}>{lang === "zh" ? "重置生成" : "Reset"}</button>
                         </div>
@@ -2042,7 +2176,7 @@ function App() {
                       </section>
 
                       <div className="form-actions provider-save-actions">
-                        <button className="primary-btn big lively-btn" onClick={saveAndSwitch} disabled={loading}>{loading ? <Loader2 size={18} className="spin" /> : <Zap size={18} />} {loading ? (lang === "zh" ? "保存中..." : "Saving...") : t.provider.saveAndSwitch}</button>
+                        <button className="primary-btn big lively-btn" onClick={saveProviderConfig} disabled={loading}>{loading ? <Loader2 size={18} className="spin" /> : <CheckCircle2 size={18} />} {loading ? (lang === "zh" ? "保存中..." : "Saving...") : t.provider.saveAndSwitch}</button>
                       </div>
                     </div>
                   </div>
@@ -2204,8 +2338,8 @@ function App() {
                     <button className="ghost-btn add-provider-btn lively-btn" onClick={() => void loadSkillsMcp()} disabled={actionBusy === "loadSkillsMcp"}>
                       {actionBusy === "loadSkillsMcp" ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />} {lang === "zh" ? "刷新" : "Refresh"}
                     </button>
-                    <button className="secondary-btn add-provider-btn lively-btn" onClick={importExistingSkillsMcp} disabled={Boolean(actionBusy)}>
-                      {actionBusy === "importExistingSkillsMcp" ? <Loader2 size={18} className="spin" /> : <Download size={18} />} {lang === "zh" ? "导入已有" : "Import existing"}
+                    <button className="secondary-btn add-provider-btn lively-btn" onClick={openImportExistingSkillsMcpPreview} disabled={Boolean(actionBusy)}>
+                      {actionBusy === "previewExistingSkillsMcp" ? <Loader2 size={18} className="spin" /> : <Download size={18} />} {lang === "zh" ? "导入已有" : "Import existing"}
                     </button>
                     <button className="secondary-btn add-provider-btn lively-btn" onClick={() => skillZipImportRef.current?.click()} disabled={Boolean(actionBusy)}>
                       {actionBusy === "installSkillZip" ? <Loader2 size={18} className="spin" /> : <Upload size={18} />} {lang === "zh" ? "从 ZIP 安装" : "Install ZIP"}

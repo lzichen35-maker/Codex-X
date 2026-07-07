@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 mod constants;
@@ -110,7 +110,8 @@ struct BackupEntry {
 #[serde(rename_all = "camelCase")]
 struct ProviderInput {
     config_dir: Option<String>,
-    provider_id: Option<String>,
+    #[serde(rename = "providerId")]
+    _provider_id: Option<String>,
     provider_name: String,
     base_url: String,
     model: String,
@@ -133,6 +134,7 @@ struct ProviderConnectionResult {
     ok: bool,
     status: Option<u16>,
     message: String,
+    duration_ms: u128,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +153,7 @@ struct SavedProvider {
     base_url: String,
     model: String,
     api_key: Option<String>,
+    toml_config: Option<String>,
     wire_api: String,
     requires_openai_auth: bool,
 }
@@ -330,6 +333,14 @@ struct SkillsMcpActionResult {
     state: SkillsMcpState,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsMcpImportPreview {
+    skills: Vec<ManagedSkill>,
+    mcp_servers: Vec<ManagedMcpServer>,
+    warnings: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 struct RolloutScan {
     rollout_files: usize,
@@ -390,6 +401,31 @@ fn db_path() -> Result<PathBuf> {
     Ok(app_home()?.join("codexx.db"))
 }
 
+fn ensure_sqlite_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<()> {
+    let cols = table_column_set(conn, table)?;
+    if cols.contains(column) {
+        return Ok(());
+    }
+    match conn.execute(alter_sql, []) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let message = e.to_string().to_ascii_lowercase();
+            if message.contains("duplicate column") || message.contains("duplicate column name") {
+                // Another running Codex-X process may have applied the same
+                // lightweight migration between our PRAGMA check and ALTER.
+                Ok(())
+            } else {
+                Err(CodexxError::Database(e.to_string()))
+            }
+        }
+    }
+}
+
 fn open_db() -> Result<Connection> {
     let path = db_path()?;
     if let Some(parent) = path.parent() {
@@ -403,6 +439,7 @@ fn open_db() -> Result<Connection> {
             base_url TEXT NOT NULL,
             model TEXT NOT NULL,
             api_key TEXT,
+            toml_config TEXT,
             wire_api TEXT NOT NULL DEFAULT 'responses',
             requires_openai_auth INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
@@ -445,6 +482,12 @@ fn open_db() -> Result<Connection> {
         );",
     )
     .map_err(|e| CodexxError::Database(e.to_string()))?;
+    ensure_sqlite_column(
+        &conn,
+        "providers",
+        "toml_config",
+        "ALTER TABLE providers ADD COLUMN toml_config TEXT",
+    )?;
     conn.execute(
         "DELETE FROM prompts
          WHERE id LIKE 'external-%'
@@ -491,7 +534,7 @@ fn list_saved_providers_inner() -> Result<Vec<SavedProvider>> {
     let conn = open_db()?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, provider_name, base_url, model, api_key, wire_api, requires_openai_auth
+            "SELECT id, provider_name, base_url, model, api_key, toml_config, wire_api, requires_openai_auth
              FROM providers
              ORDER BY created_at ASC, updated_at ASC",
         )
@@ -504,8 +547,9 @@ fn list_saved_providers_inner() -> Result<Vec<SavedProvider>> {
                 base_url: row.get(2)?,
                 model: row.get(3)?,
                 api_key: row.get(4)?,
-                wire_api: row.get(5)?,
-                requires_openai_auth: row.get::<_, i64>(6)? != 0,
+                toml_config: row.get(5)?,
+                wire_api: row.get(6)?,
+                requires_openai_auth: row.get::<_, i64>(7)? != 0,
             })
         })
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -517,18 +561,58 @@ fn list_saved_providers_inner() -> Result<Vec<SavedProvider>> {
     Ok(providers)
 }
 
+fn existing_provider_id_by_identity(provider: &SavedProvider) -> Result<Option<String>> {
+    let conn = open_db()?;
+    let name = provider.provider_name.trim().to_ascii_lowercase();
+    let base_url = provider
+        .base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM providers
+             WHERE lower(trim(provider_name)) = ?1
+               AND lower(rtrim(trim(base_url), '/')) = ?2
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT 1",
+        )
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    stmt.query_row(params![name, base_url], |row| row.get(0))
+        .map(Some)
+        .or_else(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|e| CodexxError::Database(e.to_string()))
+}
+
+fn save_imported_provider_inner(mut provider: SavedProvider) -> Result<SavedProvider> {
+    if let Some(existing_id) = existing_provider_id_by_identity(&provider)? {
+        // cc-switch can regenerate provider ids when importing from deep links.
+        // For Codex-X users this should update the existing card/key instead of
+        // creating a visually identical stale duplicate.
+        provider.id = existing_id;
+    }
+    save_provider_inner(provider)
+}
+
 fn save_provider_inner(provider: SavedProvider) -> Result<SavedProvider> {
     let conn = open_db()?;
     let now = now_rfc3339();
     conn.execute(
         "INSERT INTO providers
-            (id, provider_name, base_url, model, api_key, wire_api, requires_openai_auth, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+            (id, provider_name, base_url, model, api_key, toml_config, wire_api, requires_openai_auth, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
          ON CONFLICT(id) DO UPDATE SET
             provider_name = excluded.provider_name,
             base_url = excluded.base_url,
             model = excluded.model,
             api_key = excluded.api_key,
+            toml_config = excluded.toml_config,
             wire_api = excluded.wire_api,
             requires_openai_auth = excluded.requires_openai_auth,
             updated_at = excluded.updated_at",
@@ -538,6 +622,7 @@ fn save_provider_inner(provider: SavedProvider) -> Result<SavedProvider> {
             provider.base_url,
             provider.model,
             provider.api_key,
+            provider.toml_config,
             provider.wire_api,
             if provider.requires_openai_auth { 1 } else { 0 },
             now,
@@ -1535,6 +1620,125 @@ fn import_existing_skills_mcp_inner(config_dir: Option<String>) -> Result<Skills
     })
 }
 
+fn preview_ccswitch_mcp_servers_for_codex(codex_dir: &Path) -> Result<Vec<ManagedMcpServer>> {
+    let db = default_ccswitch_db_path()?;
+    if !db.exists() {
+        return Ok(vec![]);
+    }
+    let conn = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| {
+        CodexxError::Database(format!(
+            "打开 cc-switch MCP 数据库失败 {}: {e}",
+            db.display()
+        ))
+    })?;
+    let mut stmt = match conn
+        .prepare("SELECT id, name, server_config, enabled_codex FROM mcp_servers ORDER BY name ASC, id ASC")
+        .or_else(|_| {
+            conn.prepare("SELECT id, name, server_config, 0 AS enabled_codex FROM mcp_servers ORDER BY name ASC, id ASC")
+        }) {
+        Ok(stmt) => stmt,
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.to_lowercase().contains("no such table") =>
+        {
+            return Ok(vec![]);
+        }
+        Err(e) => return Err(CodexxError::Database(e.to_string())),
+    };
+    let live_enabled = list_mcp_from_config(codex_dir)?
+        .into_iter()
+        .map(|server| server.id)
+        .collect::<HashSet<_>>();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, name, config_text, enabled_codex) =
+            row.map_err(|e| CodexxError::Database(e.to_string()))?;
+        let config: Value =
+            serde_json::from_str(&config_text).unwrap_or(Value::Object(Default::default()));
+        let (transport, command, url, summary) = mcp_summary(&config);
+        out.push(ManagedMcpServer {
+            id: id.clone(),
+            name,
+            transport,
+            enabled: enabled_codex || live_enabled.contains(&id),
+            source: "cc-switch".to_string(),
+            summary,
+            command,
+            url,
+            config_json: config,
+        });
+    }
+    Ok(out)
+}
+
+fn preview_existing_skills_mcp_inner(config_dir: Option<String>) -> Result<SkillsMcpImportPreview> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    let skills_dir = codex_skills_dir(&codex_dir);
+    let mut warnings = Vec::new();
+    let mut skills = Vec::new();
+    let mut seen = HashSet::new();
+    let candidates = vec![
+        home_dir()?.join(".agents").join("skills"),
+        home_dir()?.join(".cc-switch").join("skills"),
+    ];
+    for base in candidates {
+        if !base.exists() {
+            continue;
+        }
+        let source = base
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "外部目录".to_string());
+        let before = skills.len();
+        if let Err(e) = scan_skill_dir(&base, false, &source, &mut skills, &mut seen) {
+            warnings.push(e.to_string());
+        }
+        for skill in &mut skills[before..] {
+            if skills_dir.join(&skill.directory).exists() {
+                skill.update_status = "已存在，将跳过".to_string();
+            } else {
+                skill.update_status = "可导入".to_string();
+            }
+        }
+    }
+    skills.retain(|skill| skill.update_status != "已存在，将跳过");
+
+    let mut mcp_servers = list_mcp_from_config(&codex_dir)?;
+    for server in &mut mcp_servers {
+        server.source = "config.toml".to_string();
+    }
+    let mut seen_mcp = mcp_servers
+        .iter()
+        .map(|server| server.id.clone())
+        .collect::<HashSet<_>>();
+    for server in preview_ccswitch_mcp_servers_for_codex(&codex_dir)? {
+        if seen_mcp.insert(server.id.clone()) {
+            mcp_servers.push(server);
+        }
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    mcp_servers.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(SkillsMcpImportPreview {
+        skills,
+        mcp_servers,
+        warnings,
+    })
+}
+
 fn toggle_codex_mcp_inner(
     config_dir: Option<String>,
     id: String,
@@ -2147,6 +2351,7 @@ fn build_ccswitch_codex_provider(
         base_url: section.base_url,
         model: section.model.unwrap_or_else(|| "gpt-5.5".to_string()),
         api_key,
+        toml_config: None,
         wire_api: section.wire_api,
         requires_openai_auth: section.requires_openai_auth,
     })
@@ -2357,7 +2562,7 @@ fn import_ccswitch_codex_providers_inner(path: Option<String>) -> Result<ImportR
     for row in rows_vec {
         match build_ccswitch_codex_provider(&row, &global_sections) {
             Some(provider) => {
-                save_provider_inner(provider)?;
+                save_imported_provider_inner(provider)?;
                 imported += 1;
             }
             None => {
@@ -3663,6 +3868,13 @@ async fn import_existing_skills_mcp(config_dir: Option<String>) -> Result<Skills
 }
 
 #[tauri::command]
+async fn preview_existing_skills_mcp(config_dir: Option<String>) -> Result<SkillsMcpImportPreview> {
+    tauri::async_runtime::spawn_blocking(move || preview_existing_skills_mcp_inner(config_dir))
+        .await
+        .map_err(|e| CodexxError::Config(format!("预览已有 Skills/MCP 失败: {e}")))?
+}
+
+#[tauri::command]
 async fn toggle_codex_skill(
     config_dir: Option<String>,
     id: String,
@@ -3896,6 +4108,10 @@ fn save_provider_command_inner(provider: SavedProvider) -> Result<SavedProvider>
             .api_key
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
+        toml_config: provider
+            .toml_config
+            .map(|s| s.trim_end().to_string())
+            .filter(|s| !s.trim().is_empty()),
         wire_api: if provider.wire_api.trim().is_empty() {
             "responses".to_string()
         } else {
@@ -3958,8 +4174,9 @@ fn apply_official_config(
     let text = read_to_string_if_exists(&cfg)?;
     let mut doc = parse_toml_document(&cfg, &text)?;
 
-    // 官方模式不应指向自定义路由。
-    doc.as_table_mut().remove("model_provider");
+    // 官方模式显式指向 Codex 内置 OpenAI provider，避免从第三方 custom
+    // 切回官方时仍被旧版 Codex/缓存误判为自定义路由。
+    doc["model_provider"] = value("openai");
     let mut remove_model_providers = false;
     if let Some(providers) = doc
         .as_table_mut()
@@ -4004,34 +4221,76 @@ fn apply_official_config(
     })
 }
 
+fn switch_official_provider_inner(config_dir: Option<String>) -> Result<ActionResult> {
+    // Switching to official must not overwrite auth.json with a stale cc-switch
+    // ChatGPT token. Codex desktop/CLI owns the live official login flow; after
+    // the user logs in, Codex-X should simply refresh and display ~/.codex/auth.json.
+    apply_official_config(
+        config_dir,
+        None,
+        None,
+        "switch-official",
+        "已切换到 OpenAI Official（auth.json 保持当前 live 状态）",
+    )
+}
+
 #[tauri::command]
 async fn switch_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || {
-        apply_official_config(
-            config_dir,
-            None,
-            None,
-            "switch-official",
-            "已切换到 OpenAI Official",
-        )
-    })
-    .await
-    .map_err(|e| CodexxError::Config(format!("切换官方配置失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || switch_official_provider_inner(config_dir))
+        .await
+        .map_err(|e| CodexxError::Config(format!("切换官方配置失败: {e}")))?
 }
 
 #[tauri::command]
 async fn save_official_config(input: OfficialConfigInput) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        apply_official_config(
-            input.config_dir,
-            input.model,
-            input.auth_json,
-            "save-official",
-            "已保存 OpenAI Official 配置",
-        )
+        save_official_config_inner(input.config_dir, input.model, input.auth_json)
     })
     .await
     .map_err(|e| CodexxError::Config(format!("保存官方配置失败: {e}")))?
+}
+
+fn save_official_config_inner(
+    config_dir: Option<String>,
+    model: Option<String>,
+    auth_json: Option<String>,
+) -> Result<ActionResult> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
+    let cfg = config_path(&codex_dir);
+    let auth = auth_path(&codex_dir);
+    let backup_id = create_backup(&codex_dir, "save-official")?;
+
+    let text = read_to_string_if_exists(&cfg)?;
+    let mut doc = parse_toml_document(&cfg, &text)?;
+    if let Some(model) = model
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        doc["model"] = value(model);
+        write_text(&cfg, &doc.to_string())?;
+    }
+
+    if let Some(auth_json) = auth_json
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        let parsed: Value = serde_json::from_str(&auth_json).map_err(|e| json_err(&auth, e))?;
+        if !parsed.is_object() {
+            return Err(CodexxError::Config(
+                "auth.json 必须是 JSON object".to_string(),
+            ));
+        }
+        write_json(&auth, &parsed)?;
+    }
+
+    let state = build_state(codex_dir)?;
+    Ok(ActionResult {
+        ok: true,
+        message: "已保存 OpenAI Official 配置（未切换启用）".to_string(),
+        backup_id,
+        state,
+    })
 }
 
 fn enable_instruction_inner(config_dir: Option<String>, template_id: &str) -> Result<ActionResult> {
@@ -4167,7 +4426,7 @@ fn save_provider_toml_config_inner(input: ProviderTomlInput) -> Result<ActionRes
             auth_value = json!({});
         }
         auth_value["OPENAI_API_KEY"] = Value::String(api_key);
-        auth_value["auth_mode"] = Value::String("api_key".to_string());
+        auth_value["auth_mode"] = Value::String("apikey".to_string());
         write_json(&auth, &auth_value)?;
     }
 
@@ -4187,7 +4446,39 @@ async fn save_provider_toml_config(input: ProviderTomlInput) -> Result<ActionRes
         .map_err(|e| CodexxError::Config(format!("保存供应商 TOML 失败: {e}")))?
 }
 
-fn test_provider_connection_inner(base_url: String) -> Result<ProviderConnectionResult> {
+fn provider_test_request(
+    agent: &ureq::Agent,
+    url: &str,
+    api_key: Option<&str>,
+) -> std::result::Result<ureq::Response, ureq::Error> {
+    let request = agent.get(url);
+    if let Some(api_key) = api_key.filter(|s| !s.trim().is_empty()) {
+        request.set("Authorization", &format!("Bearer {}", api_key.trim()))
+    } else {
+        request
+    }
+    .call()
+}
+
+fn provider_status_result(status: u16, duration_ms: u128) -> ProviderConnectionResult {
+    ProviderConnectionResult {
+        ok: (200..300).contains(&status),
+        status: Some(status),
+        message: if (200..300).contains(&status) {
+            format!("{duration_ms} ms")
+        } else if status == 401 || status == 403 {
+            format!("HTTP {status} · {duration_ms} ms（认证失败或无权限）")
+        } else {
+            format!("HTTP {status} · {duration_ms} ms")
+        },
+        duration_ms,
+    }
+}
+
+fn test_provider_connection_inner(
+    base_url: String,
+    api_key: Option<String>,
+) -> Result<ProviderConnectionResult> {
     let base = base_url.trim().trim_end_matches('/').to_string();
     if base.is_empty() {
         return Err(CodexxError::Config("base_url 不能为空".to_string()));
@@ -4198,46 +4489,58 @@ fn test_provider_connection_inner(base_url: String) -> Result<ProviderConnection
         ));
     }
 
+    let api_key = api_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(6))
         .build();
     let models_url = format!("{base}/models");
-    let candidates = [models_url.as_str(), base.as_str()];
-    let mut last_error = String::new();
+    let started = Instant::now();
 
-    for url in candidates {
-        match agent.get(url).call() {
-            Ok(response) => {
-                let status = response.status();
-                return Ok(ProviderConnectionResult {
-                    ok: (200..500).contains(&status),
-                    status: Some(status),
-                    message: format!("{url} HTTP {status}"),
-                });
-            }
-            Err(ureq::Error::Status(status, _)) => {
-                return Ok(ProviderConnectionResult {
-                    ok: status < 500,
-                    status: Some(status),
-                    message: format!("{url} HTTP {status}"),
-                });
-            }
-            Err(e) => {
-                last_error = format!("{url}: {e}");
+    match provider_test_request(&agent, &models_url, api_key) {
+        Ok(response) => {
+            return Ok(provider_status_result(
+                response.status(),
+                started.elapsed().as_millis(),
+            ))
+        }
+        Err(ureq::Error::Status(status, _)) => {
+            // /models exists but rejected the request. This is not a successful
+            // provider test; notably HTTP 403 must not be shown as “连接正常”.
+            return Ok(provider_status_result(
+                status,
+                started.elapsed().as_millis(),
+            ));
+        }
+        Err(_models_error) => {
+            // Network-level failure on /models: try the base endpoint once so
+            // users can distinguish DNS/TLS failures from a provider with no
+            // models route.
+            match provider_test_request(&agent, &base, api_key) {
+                Ok(response) => Ok(provider_status_result(
+                    response.status(),
+                    started.elapsed().as_millis(),
+                )),
+                Err(ureq::Error::Status(status, _)) => Ok(provider_status_result(
+                    status,
+                    started.elapsed().as_millis(),
+                )),
+                Err(_base_error) => Ok(ProviderConnectionResult {
+                    ok: false,
+                    status: None,
+                    message: format!("请求失败 · {} ms", started.elapsed().as_millis()),
+                    duration_ms: started.elapsed().as_millis(),
+                }),
             }
         }
     }
-
-    Ok(ProviderConnectionResult {
-        ok: false,
-        status: None,
-        message: last_error,
-    })
 }
 
 #[tauri::command]
-async fn test_provider_connection(base_url: String) -> Result<ProviderConnectionResult> {
-    tauri::async_runtime::spawn_blocking(move || test_provider_connection_inner(base_url))
+async fn test_provider_connection(
+    base_url: String,
+    api_key: Option<String>,
+) -> Result<ProviderConnectionResult> {
+    tauri::async_runtime::spawn_blocking(move || test_provider_connection_inner(base_url, api_key))
         .await
         .map_err(|e| CodexxError::Config(format!("测试连接失败: {e}")))?
 }
@@ -4250,13 +4553,12 @@ fn switch_provider_inner(input: ProviderInput) -> Result<ActionResult> {
     let backup_id = create_backup(&codex_dir, "switch-provider")?;
 
     let provider_name = input.provider_name.trim();
-    let provider_key = input
-        .provider_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(custom_provider_id)
-        .unwrap_or_else(|| custom_provider_id(provider_name));
+    // Keep the saved provider id only for Codex-X/cc-switch bookkeeping.
+    // cc-switch writes third-party Codex providers to the live config as
+    // `model_provider = "custom"` + `[model_providers.custom]`; mirroring
+    // that behavior avoids Codex CLI/App versions that ignore arbitrary live
+    // provider ids or keep resolving the previous custom provider.
+    let live_provider_key = "custom";
     let base_url = input.base_url.trim().trim_end_matches('/');
     let model = input.model.trim();
     if provider_name.is_empty() {
@@ -4271,40 +4573,33 @@ fn switch_provider_inner(input: ProviderInput) -> Result<ActionResult> {
 
     let text = read_to_string_if_exists(&cfg)?;
     let mut doc = parse_toml_document(&cfg, &text)?;
-    doc["model_provider"] = value(provider_key.as_str());
+    doc["model_provider"] = value(live_provider_key);
     doc["model"] = value(model);
     set_top_level_defaults(&mut doc);
 
     let root = doc.as_table_mut();
     let providers = ensure_table(root, "model_providers")?;
-    let provider_table = ensure_table(providers, provider_key.as_str())?;
+    providers.remove(live_provider_key);
+    let provider_table = ensure_table(providers, live_provider_key)?;
     provider_table["name"] = value(provider_name);
     provider_table["base_url"] = value(base_url);
     provider_table["wire_api"] = value(input.wire_api.unwrap_or_else(|| "responses".to_string()));
-    provider_table["requires_openai_auth"] = value(input.requires_openai_auth.unwrap_or(false));
+    provider_table["requires_openai_auth"] = value(input.requires_openai_auth.unwrap_or(true));
+
+    // Do not put the API key into config.toml by default. cc-switch stores the
+    // third-party key in auth.json, which is what Codex's current desktop/CLI
+    // builds reliably consume for custom providers.
+    write_text(&cfg, &doc.to_string())?;
 
     let api_key = input
         .api_key
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    if let Some(api_key) = api_key.as_deref() {
-        provider_table["experimental_bearer_token"] = value(api_key);
-    }
-
-    write_text(&cfg, &doc.to_string())?;
-
     if let Some(api_key) = api_key {
-        let mut auth_value = if auth.exists() {
-            let text = fs::read_to_string(&auth).map_err(|e| io_err(&auth, e))?;
-            serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}))
-        } else {
-            json!({})
-        };
-        if !auth_value.is_object() {
-            auth_value = json!({});
-        }
-        auth_value["OPENAI_API_KEY"] = Value::String(api_key);
-        auth_value["auth_mode"] = Value::String("api_key".to_string());
+        let auth_value = json!({
+            "OPENAI_API_KEY": api_key,
+            "auth_mode": "apikey",
+        });
         write_json(&auth, &auth_value)?;
     }
 
@@ -4415,6 +4710,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_about_info,
             get_skills_mcp_state,
+            preview_existing_skills_mcp,
             import_existing_skills_mcp,
             toggle_codex_skill,
             toggle_codex_mcp,
@@ -4468,11 +4764,11 @@ mod tests {
     }
 
     #[test]
-    fn switch_provider_writes_real_provider_key_and_api_key_auth_mode() {
+    fn switch_provider_writes_ccswitch_custom_provider_and_api_key_auth_mode() {
         let codex_dir = temp_codex_dir("switch-provider");
         let result = switch_provider_inner(ProviderInput {
             config_dir: Some(codex_dir.display().to_string()),
-            provider_id: Some("magicai".to_string()),
+            _provider_id: Some("magicai".to_string()),
             provider_name: "MagicAI".to_string(),
             base_url: "https://example.com/v1/".to_string(),
             model: "gpt-5.5".to_string(),
@@ -4482,14 +4778,16 @@ mod tests {
         })
         .expect("switch provider");
 
-        assert_eq!(result.state.model_provider.as_deref(), Some("magicai"));
+        assert_eq!(result.state.model_provider.as_deref(), Some("custom"));
         assert_eq!(result.state.model.as_deref(), Some("gpt-5.5"));
 
         let config_text = fs::read_to_string(config_path(&codex_dir)).expect("read config");
-        assert!(config_text.contains("model_provider = \"magicai\""));
-        assert!(config_text.contains("[model_providers.magicai]"));
-        assert!(config_text.contains("requires_openai_auth = false"));
-        assert!(config_text.contains("experimental_bearer_token = \"sk-test\""));
+        assert!(config_text.contains("model_provider = \"custom\""));
+        assert!(config_text.contains("[model_providers.custom]"));
+        assert!(config_text.contains("name = \"MagicAI\""));
+        assert!(config_text.contains("base_url = \"https://example.com/v1\""));
+        assert!(config_text.contains("requires_openai_auth = true"));
+        assert!(!config_text.contains("experimental_bearer_token = \"sk-test\""));
 
         let auth_text = fs::read_to_string(auth_path(&codex_dir)).expect("read auth");
         let auth: Value = serde_json::from_str(&auth_text).expect("parse auth");
@@ -4499,18 +4797,18 @@ mod tests {
         );
         assert_eq!(
             auth.get("auth_mode").and_then(Value::as_str),
-            Some("api_key")
+            Some("apikey")
         );
 
         let _ = fs::remove_dir_all(codex_dir);
     }
 
     #[test]
-    fn switch_provider_avoids_reserved_builtin_provider_ids() {
+    fn switch_provider_reserved_builtin_ids_still_write_live_custom() {
         let codex_dir = temp_codex_dir("switch-provider-reserved");
         let result = switch_provider_inner(ProviderInput {
             config_dir: Some(codex_dir.display().to_string()),
-            provider_id: Some("openai".to_string()),
+            _provider_id: Some("openai".to_string()),
             provider_name: "OpenAI".to_string(),
             base_url: "https://proxy.example.com/v1".to_string(),
             model: "gpt-5.5".to_string(),
@@ -4520,16 +4818,64 @@ mod tests {
         })
         .expect("switch provider");
 
-        assert_eq!(
-            result.state.model_provider.as_deref(),
-            Some("openai-custom")
-        );
+        assert_eq!(result.state.model_provider.as_deref(), Some("custom"));
         let config_text = fs::read_to_string(config_path(&codex_dir)).expect("read config");
-        assert!(config_text.contains("model_provider = \"openai-custom\""));
-        assert!(config_text.contains("[model_providers.openai-custom]"));
+        assert!(config_text.contains("model_provider = \"custom\""));
+        assert!(config_text.contains("[model_providers.custom]"));
         assert!(!config_text.contains("[model_providers.openai]"));
 
         let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn switch_official_preserves_live_auth_json() {
+        let codex_dir = temp_codex_dir("switch-official-preserve-auth");
+        write_text(
+            &config_path(&codex_dir),
+            r#"model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+name = "Proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#,
+        )
+        .expect("write config");
+        write_json(
+            &auth_path(&codex_dir),
+            &json!({
+                "OPENAI_API_KEY": "sk-live",
+                "auth_mode": "apikey"
+            }),
+        )
+        .expect("write auth");
+
+        let result =
+            switch_official_provider_inner(Some(codex_dir.display().to_string())).expect("switch");
+        assert_eq!(result.state.model_provider.as_deref(), Some("openai"));
+
+        let auth_text = fs::read_to_string(auth_path(&codex_dir)).expect("read auth");
+        let auth: Value = serde_json::from_str(&auth_text).expect("parse auth");
+        assert_eq!(
+            auth.get("OPENAI_API_KEY").and_then(Value::as_str),
+            Some("sk-live")
+        );
+        assert_eq!(
+            auth.get("auth_mode").and_then(Value::as_str),
+            Some("apikey")
+        );
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn provider_status_403_is_not_ok() {
+        let result = provider_status_result(403, 123);
+        assert!(!result.ok);
+        assert_eq!(result.status, Some(403));
+        assert_eq!(result.duration_ms, 123);
     }
 
     #[test]
