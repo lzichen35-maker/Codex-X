@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use thiserror::Error;
 
 mod constants;
@@ -124,6 +125,14 @@ struct ProviderTomlInput {
     config_dir: Option<String>,
     config_text: String,
     api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderConnectionResult {
+    ok: bool,
+    status: Option<u16>,
+    message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1924,6 +1933,45 @@ fn sanitize_id(input: &str) -> String {
     }
 }
 
+fn reserved_codex_provider_id(id: &str) -> bool {
+    matches!(
+        id.trim().to_ascii_lowercase().as_str(),
+        "openai" | "amazon-bedrock" | "ollama" | "lmstudio" | "oss"
+    )
+}
+
+fn custom_provider_id(input: &str) -> String {
+    let id = sanitize_id(input);
+    if reserved_codex_provider_id(&id) {
+        format!("{id}-custom")
+    } else {
+        id
+    }
+}
+
+fn experimental_bearer_token_from_doc(
+    doc: &DocumentMut,
+    provider_id: Option<&str>,
+) -> Option<String> {
+    let token_from_table = provider_id.and_then(|id| {
+        doc.get("model_providers")
+            .and_then(|item| item.as_table())
+            .and_then(|providers| providers.get(id))
+            .and_then(|item| item.as_table())
+            .and_then(|table| table.get("experimental_bearer_token"))
+            .and_then(|item| item.as_str())
+    });
+
+    token_from_table
+        .or_else(|| {
+            doc.get("experimental_bearer_token")
+                .and_then(|item| item.as_str())
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
 fn extract_ccswitch_codex_provider(
     id: &str,
     name: &str,
@@ -1946,6 +1994,8 @@ fn extract_ccswitch_codex_provider(
     let model = string_value(&doc, "model").unwrap_or_else(|| "gpt-5.5".to_string());
     let active_provider =
         string_value(&doc, "model_provider").unwrap_or_else(|| "custom".to_string());
+    let api_key =
+        api_key.or_else(|| experimental_bearer_token_from_doc(&doc, Some(&active_provider)));
 
     let provider_table = doc
         .get("model_providers")
@@ -1984,7 +2034,7 @@ fn extract_ccswitch_codex_provider(
         .unwrap_or(false);
 
     Some(SavedProvider {
-        id: sanitize_id(id),
+        id: custom_provider_id(id),
         provider_name,
         base_url,
         model,
@@ -3450,6 +3500,26 @@ fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Table> {
         .ok_or_else(|| CodexxError::Config(format!("{key} 不是 TOML table")))
 }
 
+fn set_provider_bearer_token(doc: &mut DocumentMut, token: &str) {
+    let token = token.trim();
+    if token.is_empty() {
+        return;
+    }
+    let provider_id = string_value(doc, "model_provider");
+    if let Some(provider_id) = provider_id {
+        if let Some(provider_table) = doc
+            .get_mut("model_providers")
+            .and_then(|item| item.as_table_mut())
+            .and_then(|providers| providers.get_mut(provider_id.as_str()))
+            .and_then(|item| item.as_table_mut())
+        {
+            provider_table["experimental_bearer_token"] = value(token);
+            return;
+        }
+    }
+    doc["experimental_bearer_token"] = value(token);
+}
+
 #[tauri::command]
 async fn get_skills_mcp_state(config_dir: Option<String>) -> Result<SkillsMcpState> {
     tauri::async_runtime::spawn_blocking(move || build_skills_mcp_state_inner(config_dir))
@@ -3690,7 +3760,7 @@ async fn list_saved_providers() -> Result<Vec<SavedProvider>> {
 
 fn save_provider_command_inner(provider: SavedProvider) -> Result<SavedProvider> {
     let normalized = SavedProvider {
-        id: provider.id.trim().to_string(),
+        id: custom_provider_id(&provider.id),
         provider_name: provider.provider_name.trim().to_string(),
         base_url: provider.base_url.trim().trim_end_matches('/').to_string(),
         model: provider.model.trim().to_string(),
@@ -3943,19 +4013,22 @@ fn save_provider_toml_config_inner(input: ProviderTomlInput) -> Result<ActionRes
     let backup_id = create_backup(&codex_dir, "save-provider-toml")?;
 
     let config_text = input.config_text.trim_end().to_string();
-    let doc = parse_toml_document(&cfg, &config_text)?;
+    let mut doc = parse_toml_document(&cfg, &config_text)?;
     if string_value(&doc, "model").is_none() {
         return Err(CodexxError::Config(
             "config.toml 必须包含 model".to_string(),
         ));
     }
-    write_text(&cfg, &(config_text + "\n"))?;
-
-    if let Some(api_key) = input
+    let api_key = input
         .api_key
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
+        .filter(|s| !s.is_empty());
+    if let Some(api_key) = api_key.as_deref() {
+        set_provider_bearer_token(&mut doc, api_key);
+    }
+    write_text(&cfg, &(doc.to_string().trim_end().to_string() + "\n"))?;
+
+    if let Some(api_key) = api_key {
         let mut auth_value = if auth.exists() {
             let text = fs::read_to_string(&auth).map_err(|e| io_err(&auth, e))?;
             serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}))
@@ -3986,6 +4059,61 @@ async fn save_provider_toml_config(input: ProviderTomlInput) -> Result<ActionRes
         .map_err(|e| CodexxError::Config(format!("保存供应商 TOML 失败: {e}")))?
 }
 
+fn test_provider_connection_inner(base_url: String) -> Result<ProviderConnectionResult> {
+    let base = base_url.trim().trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return Err(CodexxError::Config("base_url 不能为空".to_string()));
+    }
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err(CodexxError::Config(
+            "base_url 必须以 http:// 或 https:// 开头".to_string(),
+        ));
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(6))
+        .build();
+    let models_url = format!("{base}/models");
+    let candidates = [models_url.as_str(), base.as_str()];
+    let mut last_error = String::new();
+
+    for url in candidates {
+        match agent.get(url).call() {
+            Ok(response) => {
+                let status = response.status();
+                return Ok(ProviderConnectionResult {
+                    ok: (200..500).contains(&status),
+                    status: Some(status),
+                    message: format!("{url} HTTP {status}"),
+                });
+            }
+            Err(ureq::Error::Status(status, _)) => {
+                return Ok(ProviderConnectionResult {
+                    ok: status < 500,
+                    status: Some(status),
+                    message: format!("{url} HTTP {status}"),
+                });
+            }
+            Err(e) => {
+                last_error = format!("{url}: {e}");
+            }
+        }
+    }
+
+    Ok(ProviderConnectionResult {
+        ok: false,
+        status: None,
+        message: last_error,
+    })
+}
+
+#[tauri::command]
+async fn test_provider_connection(base_url: String) -> Result<ProviderConnectionResult> {
+    tauri::async_runtime::spawn_blocking(move || test_provider_connection_inner(base_url))
+        .await
+        .map_err(|e| CodexxError::Config(format!("测试连接失败: {e}")))?
+}
+
 fn switch_provider_inner(input: ProviderInput) -> Result<ActionResult> {
     let codex_dir = resolve_codex_dir(input.config_dir.clone())?;
     fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
@@ -3999,8 +4127,8 @@ fn switch_provider_inner(input: ProviderInput) -> Result<ActionResult> {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(sanitize_id)
-        .unwrap_or_else(|| sanitize_id(provider_name));
+        .map(custom_provider_id)
+        .unwrap_or_else(|| custom_provider_id(provider_name));
     let base_url = input.base_url.trim().trim_end_matches('/');
     let model = input.model.trim();
     if provider_name.is_empty() {
@@ -4027,13 +4155,17 @@ fn switch_provider_inner(input: ProviderInput) -> Result<ActionResult> {
     provider_table["wire_api"] = value(input.wire_api.unwrap_or_else(|| "responses".to_string()));
     provider_table["requires_openai_auth"] = value(input.requires_openai_auth.unwrap_or(false));
 
-    write_text(&cfg, &doc.to_string())?;
-
-    if let Some(api_key) = input
+    let api_key = input
         .api_key
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
+        .filter(|s| !s.is_empty());
+    if let Some(api_key) = api_key.as_deref() {
+        provider_table["experimental_bearer_token"] = value(api_key);
+    }
+
+    write_text(&cfg, &doc.to_string())?;
+
+    if let Some(api_key) = api_key {
         let mut auth_value = if auth.exists() {
             let text = fs::read_to_string(&auth).map_err(|e| io_err(&auth, e))?;
             serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}))
@@ -4184,6 +4316,7 @@ pub fn run() {
             disable_instruction,
             switch_provider,
             save_provider_toml_config,
+            test_provider_connection,
             list_backups,
             restore_backup,
             open_url,
@@ -4228,6 +4361,7 @@ mod tests {
         assert!(config_text.contains("model_provider = \"magicai\""));
         assert!(config_text.contains("[model_providers.magicai]"));
         assert!(config_text.contains("requires_openai_auth = false"));
+        assert!(config_text.contains("experimental_bearer_token = \"sk-test\""));
 
         let auth_text = fs::read_to_string(auth_path(&codex_dir)).expect("read auth");
         let auth: Value = serde_json::from_str(&auth_text).expect("parse auth");
@@ -4239,6 +4373,84 @@ mod tests {
             auth.get("auth_mode").and_then(Value::as_str),
             Some("api_key")
         );
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn switch_provider_avoids_reserved_builtin_provider_ids() {
+        let codex_dir = temp_codex_dir("switch-provider-reserved");
+        let result = switch_provider_inner(ProviderInput {
+            config_dir: Some(codex_dir.display().to_string()),
+            provider_id: Some("openai".to_string()),
+            provider_name: "OpenAI".to_string(),
+            base_url: "https://proxy.example.com/v1".to_string(),
+            model: "gpt-5.5".to_string(),
+            api_key: Some("sk-proxy".to_string()),
+            wire_api: Some("responses".to_string()),
+            requires_openai_auth: None,
+        })
+        .expect("switch provider");
+
+        assert_eq!(
+            result.state.model_provider.as_deref(),
+            Some("openai-custom")
+        );
+        let config_text = fs::read_to_string(config_path(&codex_dir)).expect("read config");
+        assert!(config_text.contains("model_provider = \"openai-custom\""));
+        assert!(config_text.contains("[model_providers.openai-custom]"));
+        assert!(!config_text.contains("[model_providers.openai]"));
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn import_ccswitch_provider_reads_experimental_bearer_token() {
+        let settings_config = json!({
+            "auth": {},
+            "config": r#"model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+name = "Proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-from-config"
+"#,
+        })
+        .to_string();
+
+        let provider =
+            extract_ccswitch_codex_provider("openai", "Proxy", &settings_config).expect("provider");
+        assert_eq!(provider.id, "openai-custom");
+        assert_eq!(provider.api_key.as_deref(), Some("sk-from-config"));
+        assert_eq!(provider.base_url, "https://proxy.example.com/v1");
+    }
+
+    #[test]
+    fn save_provider_toml_config_writes_provider_scoped_bearer_token() {
+        let codex_dir = temp_codex_dir("save-provider-toml-token");
+        let result = save_provider_toml_config_inner(ProviderTomlInput {
+            config_dir: Some(codex_dir.display().to_string()),
+            config_text: r#"model_provider = "proxy"
+model = "gpt-5.5"
+
+[model_providers.proxy]
+name = "Proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+"#
+            .to_string(),
+            api_key: Some("sk-provider-table".to_string()),
+        })
+        .expect("save provider toml");
+
+        assert!(result.ok);
+        let config_text = fs::read_to_string(config_path(&codex_dir)).expect("read config");
+        assert!(config_text.contains("[model_providers.proxy]"));
+        assert!(config_text.contains("experimental_bearer_token = \"sk-provider-table\""));
 
         let _ = fs::remove_dir_all(codex_dir);
     }

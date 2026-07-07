@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import {
+  Activity,
   CheckCircle2,
   ChevronRight,
   Code2,
@@ -16,6 +17,7 @@ import {
   KeyRound,
   Layers3,
   Loader2,
+  PencilLine,
   Plus,
   Power,
   RefreshCw,
@@ -144,6 +146,12 @@ type ReleaseInfo = {
   body?: string;
   message?: string;
   hasUpdate?: boolean;
+};
+
+type ProviderConnectionResult = {
+  ok: boolean;
+  status?: number | null;
+  message: string;
 };
 
 
@@ -531,6 +539,15 @@ function providerId(name: string) {
   return slug || `provider-${Date.now()}`;
 }
 
+function isReservedCodexProviderId(id: string) {
+  return ["openai", "amazon-bedrock", "ollama", "lmstudio", "oss"].includes(id.trim().toLowerCase());
+}
+
+function customProviderId(name: string) {
+  const id = providerId(name);
+  return isReservedCodexProviderId(id) ? `${id}-custom` : id;
+}
+
 function StatusPill({ active, label }: { active: boolean; label: string }) {
   return <span className={cx("pill", active ? "pill-ok" : "pill-muted")}>{label}</span>;
 }
@@ -599,9 +616,10 @@ function extractOpenAiApiKey(authText?: string) {
 function buildProviderTomlPreview(provider: SavedProvider, state: CodexState | null) {
   const model = provider.model.trim() || "gpt-5.5";
   const name = provider.providerName.trim() || "your-provider";
-  const providerKey = providerId(provider.id || name || provider.baseUrl || "custom");
+  const providerKey = customProviderId(provider.id || name || provider.baseUrl || "custom");
   const baseUrl = provider.baseUrl.trim().replace(/\/+$/, "") || "https://example.com/v1";
   const wireApi = provider.wireApi || "responses";
+  const apiKey = provider.apiKey?.trim();
   const source = state?.configText?.trimEnd() || "";
   const sourceLines = source ? source.split("\n") : [];
   const keptLines: string[] = [];
@@ -651,6 +669,7 @@ function buildProviderTomlPreview(provider: SavedProvider, state: CodexState | n
     `base_url = "${tomlEscape(baseUrl)}"`,
     `wire_api = "${tomlEscape(wireApi)}"`,
     `requires_openai_auth = ${provider.requiresOpenaiAuth ? "true" : "false"}`,
+    ...(apiKey ? [`experimental_bearer_token = "${tomlEscape(apiKey)}"`] : []),
   ];
 
   return [
@@ -841,6 +860,7 @@ function App() {
   const [providerTomlDraft, setProviderTomlDraft] = React.useState("");
   const [providerTomlDirty, setProviderTomlDirty] = React.useState(false);
   const [providerApiKeyVisible, setProviderApiKeyVisible] = React.useState(false);
+  const [providerTestingId, setProviderTestingId] = React.useState("");
   const [actionBusy, setActionBusy] = React.useState<string>("");
   const [promptForm, setPromptForm] = React.useState<SavedPrompt>(blankPromptForm);
   const [officialForm, setOfficialForm] = React.useState({ model: "gpt-5.5", authJson: "" });
@@ -1010,28 +1030,33 @@ function App() {
   const refresh = React.useCallback(() => {
     call(
       async () => {
-        const [diagnostics, next, backupList, providerList, promptList, builtinStatus, about] = await Promise.all([
-          invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: configDir || null }),
+        const [next, providerList, promptList, builtinStatus, about] = await Promise.all([
           invoke<CodexState>("get_codex_state", { configDir: configDir || null }),
-          invoke<BackupEntry[]>("list_backups"),
           invoke<SavedProvider[]>("list_saved_providers"),
           invoke<SavedPrompt[]>("list_saved_prompts"),
           invoke<BuiltinPromptStatus[]>("get_builtin_prompt_status"),
           invoke<AboutInfo>("get_about_info", { configDir: configDir || null }),
         ]);
-        return { diagnostics, next, backupList, providerList, promptList, builtinStatus, about };
+        return { next, providerList, promptList, builtinStatus, about };
       },
-      ({ diagnostics, next, backupList, providerList, promptList, builtinStatus, about }) => {
-        setStartupDiagnostics(diagnostics);
+      ({ next, providerList, promptList, builtinStatus, about }) => {
         setState(next);
-        setBackups(backupList);
         setSavedProviders(providerList);
         setSavedPrompts(promptList);
         setBuiltinPromptStatus(builtinStatus);
         setAboutInfo(about);
         if (!configDir) setConfigDir(next.codexDir);
-        void invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || next.codexDir || null, targetProvider: null })
-          .then(setSessionStatus)
+        const resolvedConfigDir = configDir || next.codexDir || null;
+        void Promise.all([
+          invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: resolvedConfigDir }),
+          invoke<BackupEntry[]>("list_backups"),
+          invoke<SessionSyncStatus>("get_session_sync_status", { configDir: resolvedConfigDir, targetProvider: null }),
+        ])
+          .then(([diagnostics, backupList, sessions]) => {
+            setStartupDiagnostics(diagnostics);
+            setBackups(backupList);
+            setSessionStatus(sessions);
+          })
           .catch(() => undefined);
       },
     );
@@ -1045,13 +1070,18 @@ function App() {
   const handleActionResult = (result: ActionResult) => {
     setState(result.state);
     setToast(result.message);
+    const resolvedConfigDir = configDir || result.state.codexDir || null;
     void Promise.all([
       invoke<BackupEntry[]>("list_backups"),
       invoke<SavedPrompt[]>("list_saved_prompts"),
+      invoke<SavedProvider[]>("list_saved_providers"),
+      invoke<SessionSyncStatus>("get_session_sync_status", { configDir: resolvedConfigDir, targetProvider: null }),
     ])
-      .then(([backupList, promptList]) => {
+      .then(([backupList, promptList, providerList, sessions]) => {
         setBackups(backupList);
         setSavedPrompts(promptList);
+        setSavedProviders(providerList);
+        setSessionStatus(sessions);
       })
       .catch(() => undefined);
   };
@@ -1192,7 +1222,7 @@ function App() {
 
   const normalizedProviderForm = (): SavedProvider => ({
     ...providerForm,
-    id: editingProviderId || providerForm.id || providerId(providerForm.providerName || providerForm.baseUrl),
+    id: editingProviderId || providerForm.id || customProviderId(providerForm.providerName || providerForm.baseUrl),
     providerName: providerForm.providerName.trim(),
     baseUrl: providerForm.baseUrl.trim().replace(/\/+$/, ""),
     model: providerForm.model.trim(),
@@ -1239,6 +1269,21 @@ function App() {
         }),
       handleActionResult,
     );
+
+  const testProvider = async (id: string, baseUrl: string) => {
+    setProviderTestingId(id);
+    setError("");
+    try {
+      const result = await invoke<ProviderConnectionResult>("test_provider_connection", { baseUrl });
+      setToast(result.ok
+        ? (lang === "zh" ? `连接正常：${result.message}` : `Connection OK: ${result.message}`)
+        : (lang === "zh" ? `连接失败：${result.message}` : `Connection failed: ${result.message}`));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setProviderTestingId("");
+    }
+  };
 
   const saveAndSwitch = () =>
     call(
@@ -1528,9 +1573,9 @@ function App() {
   };
 
   const openEditDetectedProvider = (provider: { id: string; providerName: string; baseUrl: string; model: string; wireApi: string; requiresOpenaiAuth: boolean }) => {
-    setEditingProviderId(providerId(provider.providerName || provider.baseUrl));
+    setEditingProviderId(customProviderId(provider.providerName || provider.baseUrl));
     const next = {
-      id: providerId(provider.providerName || provider.baseUrl),
+      id: customProviderId(provider.providerName || provider.baseUrl),
       providerName: provider.providerName,
       baseUrl: provider.baseUrl,
       model: provider.model,
@@ -1856,7 +1901,7 @@ function App() {
                               : item.baseUrl === p.baseUrl && item.model === p.model,
                           );
                         const switchable: SavedProvider | null = p.source === "official" ? null : local || {
-                          id: providerId(p.providerName),
+                          id: customProviderId(p.providerName),
                           providerName: p.providerName,
                           baseUrl: p.baseUrl,
                           model: p.model,
@@ -1872,21 +1917,20 @@ function App() {
                               <strong>{p.providerName}</strong>
                               <a>{p.baseUrl || "no base_url"}</a>
                             </div>
-                            <div className="provider-meta">
-                              <span>{p.source === "official" ? t.provider.official : p.source === "detected" ? t.provider.detected : t.provider.local}</span>
-                              <code>{p.model}</code>
-                            </div>
                             <div className="provider-badges">
                               {p.isCurrent && <StatusPill active label={t.provider.current} />}
-                              {p.source === "official" && <StatusPill active={false} label={t.provider.noRouting} />}
-                              {p.source === "official" && <StatusPill active={state.officialAuthAvailable} label={state.officialAuthAvailable ? t.provider.authReady : t.provider.authMissing} />}
                             </div>
                             <div className="provider-actions">
-                              <button className="secondary-btn small" onClick={() => switchable ? switchProvider(switchable) : switchOfficialProvider()} disabled={loading || p.isCurrent}>{t.provider.switch}</button>
-                              {p.source === "official" && <button className="ghost-btn small" onClick={openOfficialEdit}>{t.provider.viewEdit}</button>}
-                              {local && <button className="ghost-btn small" onClick={() => openEditProvider(local)}>{t.provider.edit}</button>}
-                              {!local && p.source === "detected" && <button className="ghost-btn small" onClick={() => openEditDetectedProvider(p)}>{t.provider.edit}</button>}
-                              {local && <button className="danger-btn small" onClick={() => removeProvider(local.id)}><Trash2 size={14} /> {t.provider.remove}</button>}
+                              <button className="secondary-btn small" onClick={() => switchable ? switchProvider(switchable) : switchOfficialProvider()} disabled={loading || p.isCurrent}>{lang === "zh" ? "启用" : "Enable"}</button>
+                              {p.source !== "official" && (
+                                <button className="icon-btn small" title={lang === "zh" ? "测试连接" : "Test connection"} onClick={() => void testProvider(`${p.source}-${p.id}`, p.baseUrl)} disabled={loading || providerTestingId === `${p.source}-${p.id}`}>
+                                  {providerTestingId === `${p.source}-${p.id}` ? <Loader2 size={15} className="spin" /> : <Activity size={15} />}
+                                </button>
+                              )}
+                              {p.source === "official" && <button className="icon-btn small" title={t.provider.edit} onClick={openOfficialEdit}><PencilLine size={15} /></button>}
+                              {local && <button className="icon-btn small" title={t.provider.edit} onClick={() => openEditProvider(local)}><PencilLine size={15} /></button>}
+                              {!local && p.source === "detected" && <button className="icon-btn small" title={t.provider.edit} onClick={() => openEditDetectedProvider(p)}><PencilLine size={15} /></button>}
+                              {local && <button className="icon-btn danger small" title={t.provider.remove} onClick={() => removeProvider(local.id)}><Trash2 size={15} /></button>}
                             </div>
                           </div>
                         );
@@ -1959,7 +2003,7 @@ function App() {
                             </div>
                           </Field>
                           <Field label={lang === "zh" ? "API 请求地址" : t.provider.baseUrl}><input value={providerForm.baseUrl} onChange={(e) => setProviderForm({ ...providerForm, baseUrl: e.target.value })} /></Field>
-                          <Field label={t.provider.name}><input value={providerForm.providerName} onChange={(e) => setProviderForm({ ...providerForm, providerName: e.target.value, id: editingProviderId || providerId(e.target.value) })} /></Field>
+                          <Field label={t.provider.name}><input value={providerForm.providerName} onChange={(e) => setProviderForm({ ...providerForm, providerName: e.target.value, id: editingProviderId || customProviderId(e.target.value) })} /></Field>
                           <Field label={t.provider.model}><input value={providerForm.model} onChange={(e) => setProviderForm({ ...providerForm, model: e.target.value })} /></Field>
                           <Field label={t.provider.wireApi}>
                             <select value={providerForm.wireApi} onChange={(e) => setProviderForm({ ...providerForm, wireApi: e.target.value })}>
@@ -2292,7 +2336,7 @@ function App() {
                       </div>
                     </div>
 
-                    <div className="instruction-row-list">
+                    <div className="skills-mcp-simple-list instruction-switch-list">
                       {instructionTemplates.map((item) => {
                         const isCurrent = currentInstructionId === item.id;
                         const remoteStatus = builtinPromptStatusMap.get(item.id);
@@ -2302,7 +2346,7 @@ function App() {
                             ? (lang === "zh" ? "本地缓存" : "Local cache")
                             : (lang === "zh" ? "打包内置" : "Bundled");
                         return (
-                          <div className={cx("instruction-row", isCurrent && "selected")} key={item.id}>
+                          <article className={cx("skills-mcp-simple-row instruction-switch-row", isCurrent && "selected")} key={item.id}>
                             <div className="instruction-main">
                               <strong>{item.title}</strong>
                               <p>{item.subtitle}</p>
@@ -2311,47 +2355,50 @@ function App() {
                                 {remoteStatus?.checkedAt && <small>{new Date(remoteStatus.checkedAt).toLocaleString()}</small>}
                               </div>
                             </div>
-                            <div className="instruction-status-col">
-                              {isCurrent ? <StatusPill active label={t.provider.current} /> : <span />}
-                            </div>
-                            <div className="instruction-action-col">
-                              <button className="secondary-btn small lively-btn" onClick={() => switchInstructionTemplate(item.id)} disabled={loading || isCurrent}>{t.instruction.enable}</button>
-                              <button className="ghost-btn small" onClick={disableInstruction} disabled={loading || !isCurrent}>{lang === "zh" ? "禁用" : "Disable"}</button>
-                            </div>
-                          </div>
+                            <button
+                              className={cx("switch-toggle", isCurrent && "on")}
+                              title={isCurrent ? (lang === "zh" ? "关闭" : "Disable") : (lang === "zh" ? "启用" : "Enable")}
+                              onClick={() => isCurrent ? disableInstruction() : switchInstructionTemplate(item.id)}
+                              disabled={loading}
+                            >
+                              <span />
+                            </button>
+                          </article>
                         );
                       })}
 
                       {savedPrompts.map((prompt) => {
                         const isCurrent = Boolean(state.instructionFile) && (state.instructionFile || "").replace(/\\/g, "/").endsWith(prompt.filename);
                         return (
-                          <div className={cx("instruction-row", isCurrent && "selected")} key={prompt.id}>
+                          <article className={cx("skills-mcp-simple-row instruction-switch-row", isCurrent && "selected")} key={prompt.id}>
                             <div className="instruction-main">
                               <strong>{prompt.title}</strong>
                               <p>{lang === "zh" ? "自定义指令提示词" : "Custom instruction prompt"}</p>
                             </div>
-                            <div className="instruction-status-col">
-                              {isCurrent ? <StatusPill active label={t.provider.current} /> : <span />}
+                            <div className="instruction-icon-actions">
+                              <button
+                                className={cx("switch-toggle", isCurrent && "on")}
+                                title={isCurrent ? (lang === "zh" ? "关闭" : "Disable") : (lang === "zh" ? "启用" : "Enable")}
+                                onClick={() => isCurrent ? disableInstruction() : enableSavedPrompt(prompt.id)}
+                                disabled={loading}
+                              >
+                                <span />
+                              </button>
+                              <button className="icon-btn small" title={t.provider.edit} onClick={() => openEditPrompt(prompt)}><PencilLine size={15} /></button>
+                              <button className="icon-btn danger small" title={t.provider.remove} onClick={() => removeSavedPrompt(prompt.id)}><Trash2 size={15} /></button>
                             </div>
-                            <div className="instruction-action-col">
-                              <button className="secondary-btn small lively-btn" onClick={() => enableSavedPrompt(prompt.id)} disabled={loading || isCurrent}>{t.instruction.enable}</button>
-                              <button className="ghost-btn small" onClick={disableInstruction} disabled={loading || !isCurrent}>{lang === "zh" ? "禁用" : "Disable"}</button>
-                              <button className="ghost-btn small" onClick={() => openEditPrompt(prompt)}>{t.provider.edit}</button>
-                              <button className="danger-btn small" onClick={() => removeSavedPrompt(prompt.id)}><Trash2 size={14} /> {t.provider.remove}</button>
-                            </div>
-                          </div>
+                          </article>
                         );
                       })}
 
                       {state.instructionFile && currentInstructionId === "custom" && !savedPrompts.some((p) => state.instructionFile?.replace(/\\/g, "/").endsWith(p.filename)) && (
-                        <div className="instruction-row selected">
+                        <article className="skills-mcp-simple-row instruction-switch-row selected">
                           <div className="instruction-main">
                             <strong>{lang === "zh" ? "当前自定义指令提示词" : "Current custom prompt"}</strong>
                             <p>{lang === "zh" ? "当前使用的是外部提示词；切换到内置模板前会自动保存到下方列表，之后仍可重新启用。" : "An external prompt is currently active. It will be saved before switching to a built-in template so you can enable it again later."}</p>
                           </div>
-                          <div className="instruction-status-col"><StatusPill active label={t.provider.current} /></div>
-                          <div className="instruction-action-col"><button className="ghost-btn small" onClick={disableInstruction} disabled={loading}>{lang === "zh" ? "禁用" : "Disable"}</button></div>
-                        </div>
+                          <button className="switch-toggle on" title={lang === "zh" ? "关闭" : "Disable"} onClick={disableInstruction} disabled={loading}><span /></button>
+                        </article>
                       )}
                     </div>
                   </>

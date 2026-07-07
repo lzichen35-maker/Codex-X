@@ -2316,6 +2316,91 @@ html, body, #root {
 .switch-toggle:disabled {
   opacity: .72;
 }
+.switch-toggle:hover:not(:disabled) {
+  border-color: rgba(33,236,158,.42);
+}
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.11);
+  background: rgba(255,255,255,.055);
+  color: #aeb8ca;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .16s ease, border-color .16s ease, color .16s ease, transform .16s ease;
+}
+.icon-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  color: #f5f8ff;
+  background: rgba(255,255,255,.085);
+  border-color: rgba(124,168,255,.24);
+}
+.icon-btn.danger {
+  color: #ff9fb5;
+  background: rgba(255, 80, 120, .075);
+  border-color: rgba(255, 120, 160, .20);
+}
+.icon-btn.small {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  padding: 0;
+}
+
+/* Final compact provider list: name + URL + current pill + enable/icons. */
+.provider-row {
+  grid-template-columns: 22px 46px minmax(280px, 1fr) minmax(76px, auto) max-content;
+}
+.provider-meta {
+  display: none;
+}
+.provider-badges {
+  min-width: 0;
+  justify-content: flex-end;
+}
+.provider-actions {
+  min-width: max-content;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.provider-actions .secondary-btn.small {
+  min-width: 58px;
+}
+
+/* Prompt templates use the same compact switch-list language as Skills/MCP. */
+.instruction-switch-list {
+  gap: 8px;
+}
+.instruction-switch-row {
+  min-height: 62px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 11px 10px 11px 14px;
+}
+.instruction-switch-row.selected {
+  border-color: rgba(33,236,158,.36);
+  background: rgba(18, 72, 53, .18);
+}
+.instruction-switch-row .instruction-main strong {
+  margin-bottom: 3px;
+}
+.instruction-switch-row .instruction-main p {
+  margin: 0;
+  color: #9aa8bf;
+  font-size: 13px;
+}
+.instruction-switch-row .prompt-remote-meta {
+  margin-top: 6px;
+}
+.instruction-icon-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
 .skills-loading { min-height: 220px; }
 .session-empty.compact { min-height: 74px; }
 @media (max-width: 1280px) {
